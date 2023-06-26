@@ -271,6 +271,17 @@ This extension was inspired by [weewx-realtime_gauge_data](https://github.com/gj
         ssh_options = "-o ConnectTimeout=1"
         timeout = 1
         skip_if_older_than = 3
+    [[MQTTSpec]]
+        mqtt_enable = False
+        mqtt_broker = localhost
+        mqtt_port = 1883
+        mqtt_user =
+        mqtt_pass =
+        mqtt_topic = weewx-loopdata/loop/json
+        mqtt_qos = 1
+        mqtt_retain = False
+        mqtt_keepalive = 60
+        mqtt_clientid = weewx-loopdata
     [[Include]]
         fields = current.dateTime.raw, current.windDir.ordinal_compass, day.rain.sum, current.dewpoint, current.outTemp, current.rainRate, current.windSpeed, day.windGust.max, 10m.windGust.max, current.windSpeed
     [[BarometerTrendDescriptions]]
@@ -318,6 +329,16 @@ This extension was inspired by [weewx-realtime_gauge_data](https://github.com/gj
                          (Skip this and move on to the next if this data is older than 4 seconds.
  * `fields`            : Used to specify which fields to include in the file.
  * `BarometerTrendDescriptions` : The descriptions associated with trend.barometer.desc.  Localize as necessary.
+ * `mqtt_enable`       : Set to true to publish the loop data to `mqtt_broker`.
+ * `mqtt_broker`       : A string containing the address of the broker to connect to. Defaults to localhost.
+ * `mqtt_port`         : The port to connect to the broker on. Defaults to 1883.
+ * `mqtt_user`         : Authentication parameters for the client, is optional and will default to None if not provided.
+ * `mqtt_pass`         : Authentication parameters for the client, is optional and will default to None if not provided.
+ * `mqtt_topic`        : The topic string to which the payload will be published.
+ * `mqtt_qos`          : The qos to use when publishing, default to 0.
+ * `mqtt_retain`       : Set the message to be retained (True) or not (False), default to False.
+ * `mqtt_keepalive`    : The keepalive timeout value for the client. Defaults to 60 seconds.
+ * `mqtt_clientid`     : The MQTT client id to use. If "" or None, the Paho library will generate a client id automatically.
 
 ## What fields are available.
 
