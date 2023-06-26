@@ -56,6 +56,17 @@ class LoopDataInstaller(ExtensionInstaller):
                         'ssh_options': '-o ConnectTimeout=1',
                         'timeout': '1',
                         'skip_if_older_than': '3'},
+                    'MQTTSpec': {
+                        'mqtt_enable':'false',
+                        'mqtt_broker':'localhost',
+                        'mqtt_port':'1883',
+                        'mqtt_user':'',
+                        'mqtt_pass':'',
+                        'mqtt_topic':'',
+                        'mqtt_qos':'0',
+                        'mqtt_retain':'false',
+                        'mqtt_keepalive':'60',
+                        'mqtt_clientid':''},
                     'Include': {
                         'fields': [
                             'trend.outTemp',
