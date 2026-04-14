@@ -1,9 +1,9 @@
 # weewx-loopdata
 *Open source plugin for WeeWX software.
 
-Copyright (C)2022 by John A Kline (john@johnkline.com)
+Copyright (C)2022-2024 by John A Kline (john@johnkline.com)
 
-**This extension requires Python 3.7 or later and WeeWX 4.**
+**This extension requires Python 3.7 or later and WeeWX 4 or 5.**
 
 ## Description
 
@@ -219,6 +219,61 @@ This extension was inspired by [weewx-realtime_gauge_data](https://github.com/gj
 
 # Installation Instructions
 
+## WeeWX 5 Installation Instructions
+
+1. If pip install,
+   Activate the virtual environment (actual syntax varies by type of WeeWX install):
+   `/home/weewx/weewx-venv/bin/activate`
+   Install the sortedcontainers package.
+   `pip install sortedcontainers`
+
+1. If package install:
+   Install the `python3-sortedcontainers` package.
+   * On debian: `sudo apt install python3-sortedcontainers`
+
+1. Download the lastest release, weewx-loopdata-3.3.2.zip, from the
+   [GitHub Repository](https://github.com/chaunceygardiner/weewx-loopdata).
+
+1. Install the loopdata extension.
+
+   `weectl extension install weewx-loopdata-3.3.2.zip`
+
+1. The install creates a LoopData section in weewx.conf as shown below.  Adjust
+   the values accordingly.  In particular:
+   * Specify `seconds` with how often your device writes loopdata records
+     (e.g., `2.0` for Davis Vantage Pro 2 and RainWise CC3000).
+   * Specify the `target_report` for the report you wish to use for formatting and units
+   * Specify the `loop_data_dir` where the loop-data.txt file should be writen.
+     If `loop_data_dir` is a relative path, it will be interpreted as being relative to
+     the target_report directory.
+   * You will eventually need  to update the fields line with the fields you actually
+     need for the report you are targetting.  Change this line later after you are sure
+     LoopData is running correctly.
+   * If you need the loop-data.txt file pushed to a remote webserver,
+     you will also need to fill in the `RsyncSpec` fields; but one can fill
+     that in later, after LoopData is up and running.
+
+1. Restart WeeWX.
+
+1. Optional: Implement SSH control master multiplexing.
+   If you are rsync'ing loopdata to another machine every 2 seconds; inevitably
+   some of these rsync's will fail.  Perhpas in the order of 3 to 10 per day on the author's
+   systems.  This is totally fine and is not noticeable, but there is an easy way to make the
+   rsync's lightweight and have none of them fail.  Just create the `.ssh/config` file in the
+   under the home directory of the user running WeeWX, witt the contents listed below.
+   The Host entered must match exactly the `remove_server` value entered in the `RSyncSpec`
+   section of `LoopData` in `weewx.conf`
+   ```
+   Host www.paloaltoweather.com   # <-- CHANGE TO YOUR remote_server!
+       ControlMaster auto
+       ControlPath ~/.ssh/control-%r@%h:%p
+       ControlPersist 10m
+       ServerAliveInterval 15
+       ServerAliveCountMax 3
+   ```
+
+## WeeWX 4 Installation Instructions
+
 1. Install the `python3-sortedcontainers` package.
    * On debian: `sudo apt install python3-sortedcontainers`
 
@@ -235,7 +290,7 @@ This extension was inspired by [weewx-realtime_gauge_data](https://github.com/gj
 1. The install creates a LoopData section in weewx.conf as shown below.  Adjust
    the values accordingly.  In particular:
    * Specify `seconds` with how often your device writes loopdata records
-     (e.g., `2.5` for Davis Vantage Pro 2, `2.0` for RainWise CC3000).
+     (e.g., `2.0` for Davis Vantage Pro 2 and RainWise CC3000).
    * Specify the `target_report` for the report you wish to use for formatting and units
    * Specify the `loop_data_dir` where the loop-data.txt file should be writen.
      If `loop_data_dir` is a relative path, it will be interpreted as being relative to
@@ -249,7 +304,26 @@ This extension was inspired by [weewx-realtime_gauge_data](https://github.com/gj
 
 1. Restart WeeWX.
 
-1. After a reporting cycle runs, check navigate to `<weewx-url>/loopdata/ in your browser
+1. Optional: Implement SSH control master multiplexing.
+   If you are rsync'ing loopdata to another machine every 2 seconds; inevitably
+   some of these rsync's will fail.  Perhpas in the order of 3 to 10 per day on the author's
+   systems.  This is totally fine and is not noticeable, but there is an easy way to make the
+   rsync's lightweight and have none of them fail.  Just create the `.ssh/config` file in the
+   under the home directory of the user running WeeWX, witt the contents listed below.
+   The Host entered must match exactly the `remove_server` value entered in the `RSyncSpec`
+   section of `LoopData` in `weewx.conf`
+   ```
+   Host www.paloaltoweather.com   # <-- CHANGE TO YOUR remote_server!
+       ControlMaster auto
+       ControlPath ~/.ssh/control-%r@%h:%p
+       ControlPersist 10m
+       ServerAliveInterval 15
+       ServerAliveCountMax 3
+   ```
+
+## Checking for a Properly Running Installation
+
+1. After a reporting cycle runs, navigate to `<weewx-url>/loopdata/ in your browser
    to see the default loopdata report. (Reports typcially run every 5 minutes.)
 
 ```
@@ -393,6 +467,7 @@ You don't *have* to sync to a remote server; but if you want to sync to a remote
 rsync is the *only* mechanism provided.
 
 ## What about those rsync errors in the log?
+Note: See the installation instructions above on how to implement SSH control master multiplexing and the timeouts will go away.
 If one is using rsync, especially if the loop interval is short (e.g., 2s), it is expected that
 there will be log entries for connection timeouts, transmit timeouts, write errors and skipped
 packets.  By default only one second is allowed to connect or transmit the data.  Also, by
