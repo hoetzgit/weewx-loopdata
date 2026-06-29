@@ -1,6 +1,25 @@
 loopdata change history
 -----------------------
 
+3.9 Release 2026/06/27
+----------------------
+Add plumbing for first/last observation types (in case WeeWX fully supports thenm in the future)
+
+3.8 Release 2026/07/27
+----------------------
+Many tests added after mutation testing.
+Support .count which was mistakenly not allowed by the parser
+
+3.6 Release 2026/06/25
+----------------------
+Fix three potential latent bugs.
+Added tests to boost code coverage to 76%.  Minus I/O plumbing, test coverage is > 92%.
+
+3.5 Release 2026/06/24
+----------------------
+Bug fix for continuous vector accumulator.
+Code cleanup.
+
 3.4 Release 2026/06/20
 ----------------------
 Ensure temporary loop data file to actual is atomic.

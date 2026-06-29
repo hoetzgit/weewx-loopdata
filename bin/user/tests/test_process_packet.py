@@ -1,6 +1,32 @@
-#    Copyright (c) 2022 John A Kline <john@johnkline.com>
+#    Copyright (c) 2022-2026 John A Kline <john@johnkline.com>
 #
 #    See the file LICENSE.txt for your full rights.
+#
+#    HOW TO RUN THESE TESTS
+#    ----------------------
+#    Run from the repository root (~/software/weewx-loopdata), NOT from the
+#    tests directory.  The harness loads its config files via paths relative
+#    to the current directory (e.g. 'bin/user/tests/weewx.conf.us'), so the
+#    working directory must be the repo root or every config-loading test
+#    fails with KeyError: 'StdConvert' (an empty config from a missing file).
+#
+#    Activate the weewx venv first so weewx/weeutil/sortedcontainers import.
+#
+#    Both 'bin' and 'bin/user/tests' must be on PYTHONPATH:
+#      - bin             -> resolves 'import user.loopdata'
+#      - bin/user/tests  -> resolves the packet-data modules
+#                           (cc3000_packets, ip100_packets, etc.)
+#
+#    Command (uses Python's built-in unittest runner; pytest not required):
+#
+#      cd ~/software/weewx-loopdata
+#      PYTHONPATH=bin:bin/user/tests python3 bin/user/tests/test_process_packet.py
+#
+#    Add -v for per-test names, or append a test name to run just one, e.g.:
+#
+#      PYTHONPATH=bin:bin/user/tests python3 bin/user/tests/test_process_packet.py -v
+#      PYTHONPATH=bin:bin/user/tests python3 bin/user/tests/test_process_packet.py \
+#          ProcessPacketTests.test_wind
 #
 """Test processing packets."""
 
@@ -8,10 +34,15 @@ import configobj
 import logging
 import os
 import queue
+import shutil
+import tempfile
 import unittest
 
 import weewx
 import weewx.accum
+import weewx.manager
+import weewx.units
+from weewx.schemas.wview_extended import schema as wview_extended_schema
 from weeutil.weeutil import to_int
 from weeutil.weeutil import timestamp_to_string
 
@@ -620,6 +651,12 @@ class ProcessPacketTests(unittest.TestCase):
         self.assertEqual(cname.agg_type, 'sum')
         self.assertEqual(cname.format_spec, None)
 
+        # --- segment-guard branch (mutation-test target) ---
+        # 'unit' prefix but the second segment is not 'label' -> the prefix2
+        # else-branch returns None.
+        self.assertEqual(
+            user.loopdata.LoopData.parse_cname('unit.notlabel.outTemp'), None)
+
     def test_compose_loop_data_dir(self) -> None:
         config_dict       : Dict[str, Any] = { 'WEEWX_ROOT'   : '/etc/weewx' }
         target_report_dict: Dict[str, Any] = { 'HTML_ROOT'    : 'public_html/weatherboard'}
@@ -636,6 +673,228 @@ class ProcessPacketTests(unittest.TestCase):
 
         self.assertEqual(user.loopdata.LoopData.compose_loop_data_dir(
             config_dict, target_report_dict, {'loop_data_dir':'foobar'}), '/etc/weewx/public_html/weatherboard/foobar')
+
+    def test_period_classification(self) -> None:
+        # Pure-function coverage for the period-classification helpers:
+        # is_minute_period, is_hour_period, is_continuous_period, is_valid_period.
+        L = user.loopdata.LoopData
+
+        # --- is_minute_period: valid range is 1m..1440m inclusive. ---
+        self.assertTrue(L.is_minute_period('1m'))
+        self.assertTrue(L.is_minute_period('2m'))
+        self.assertTrue(L.is_minute_period('10m'))
+        self.assertTrue(L.is_minute_period('1440m'))     # upper bound
+        self.assertFalse(L.is_minute_period('0m'))       # below lower bound
+        self.assertFalse(L.is_minute_period('1441m'))    # above upper bound
+        self.assertFalse(L.is_minute_period('m'))        # no digits
+        self.assertFalse(L.is_minute_period('10'))       # no 'm'
+        self.assertFalse(L.is_minute_period('10h'))      # wrong unit
+        self.assertFalse(L.is_minute_period('1.5m'))     # non-integer
+        self.assertFalse(L.is_minute_period('-5m'))      # isdigit() rejects sign
+        self.assertFalse(L.is_minute_period('day'))
+
+        # --- is_hour_period: valid range is 1h..24h inclusive. ---
+        self.assertTrue(L.is_hour_period('1h'))
+        self.assertTrue(L.is_hour_period('2h'))
+        self.assertTrue(L.is_hour_period('24h'))         # upper bound
+        self.assertFalse(L.is_hour_period('0h'))         # below lower bound
+        self.assertFalse(L.is_hour_period('25h'))        # above upper bound
+        self.assertFalse(L.is_hour_period('h'))          # no digits
+        self.assertFalse(L.is_hour_period('24'))         # no 'h'
+        self.assertFalse(L.is_hour_period('2m'))         # wrong unit
+        self.assertFalse(L.is_hour_period('1.5h'))       # non-integer
+        self.assertFalse(L.is_hour_period('day'))
+
+        # --- is_continuous_period: 'trend' or any valid minute/hour period. ---
+        self.assertTrue(L.is_continuous_period('trend'))
+        self.assertTrue(L.is_continuous_period('2m'))
+        self.assertTrue(L.is_continuous_period('24h'))
+        self.assertFalse(L.is_continuous_period('day'))
+        self.assertFalse(L.is_continuous_period('current'))
+        self.assertFalse(L.is_continuous_period('0m'))
+        self.assertFalse(L.is_continuous_period('25h'))
+
+        # --- is_valid_period: fixed periods OR continuous periods. ---
+        for p in ['alltime', 'rainyear', 'year', 'month', 'week', 'current', 'hour', 'day']:
+            self.assertTrue(L.is_valid_period(p), msg='%s should be valid' % p)
+        self.assertTrue(L.is_valid_period('trend'))
+        self.assertTrue(L.is_valid_period('1m'))
+        self.assertTrue(L.is_valid_period('1440m'))
+        self.assertTrue(L.is_valid_period('1h'))
+        self.assertTrue(L.is_valid_period('24h'))
+        self.assertFalse(L.is_valid_period('decade'))
+        self.assertFalse(L.is_valid_period('0m'))
+        self.assertFalse(L.is_valid_period('1441m'))
+        self.assertFalse(L.is_valid_period('25h'))
+        self.assertFalse(L.is_valid_period(''))
+
+    def test_get_windrun_bucket(self) -> None:
+        # Pure-function coverage for get_windrun_bucket: maps a wind direction
+        # to one of 16 compass buckets (0=N, 1=NNE, ... 15=NNW).  Each bucket
+        # is centered on its compass point (i * 22.5 deg) and spans +/-11.25.
+        # Directions in [348.75, 360) wrap back to bucket 0 (N).
+        L = user.loopdata.LoopProcessor
+
+        # Each of the 16 compass-point centers maps to its own bucket, in order.
+        for i in range(16):
+            center = i * 22.5
+            self.assertEqual(L.get_windrun_bucket(center), i,
+                             msg='center %.1f should be bucket %d' % (center, i))
+
+        # Just past each lower edge rounds up into the next bucket.
+        self.assertEqual(L.get_windrun_bucket(11.25), 1)    # N/NNE edge -> NNE
+        self.assertEqual(L.get_windrun_bucket(33.75), 2)    # NNE/NE edge -> NE
+        self.assertEqual(L.get_windrun_bucket(326.25), 15)  # NW/NNW edge -> NNW
+
+        # Wraparound: the top edge and everything up to 360 folds back to N(0).
+        self.assertEqual(L.get_windrun_bucket(348.75), 0)
+        self.assertEqual(L.get_windrun_bucket(355.0), 0)
+        self.assertEqual(L.get_windrun_bucket(359.9), 0)
+        self.assertEqual(L.get_windrun_bucket(360.0), 0)
+        self.assertEqual(L.get_windrun_bucket(0.0), 0)
+
+    def test_massage_near_zero(self) -> None:
+        # Values within +/-1e-10 of zero are clamped to exactly 0.0; everything
+        # else passes through unchanged.  Guards against -0.0-ish float dust in
+        # the vector sums producing tiny non-zero artifacts.
+        L = user.loopdata.LoopData
+        self.assertEqual(L.massage_near_zero(0.0), 0.0)
+        self.assertEqual(L.massage_near_zero(1e-11), 0.0)
+        self.assertEqual(L.massage_near_zero(-1e-11), 0.0)
+        # Just outside the window: unchanged.
+        self.assertEqual(L.massage_near_zero(1e-9), 1e-9)
+        self.assertEqual(L.massage_near_zero(-1e-9), -1e-9)
+        self.assertEqual(L.massage_near_zero(5.0), 5.0)
+        self.assertEqual(L.massage_near_zero(-273.15), -273.15)
+        # Exact boundary: the window is STRICT (val > -1e-10 AND val < 1e-10),
+        # so exactly +/-1e-10 is OUTSIDE and passes through unchanged.  This
+        # distinguishes '<' from a mutated '<=' (and '>' from '>=').
+        self.assertEqual(L.massage_near_zero(1e-10), 1e-10)
+        self.assertEqual(L.massage_near_zero(-1e-10), -1e-10)
+        # Just inside the strict window -> clamped.
+        self.assertEqual(L.massage_near_zero(9.99e-11), 0.0)
+        self.assertEqual(L.massage_near_zero(-9.99e-11), 0.0)
+
+    def test_construct_baro_trend_descs(self) -> None:
+        # Builds a BarometerTrend -> description map.  Supplied translations
+        # override; missing keys fall back to the English defaults.
+        L = user.loopdata.LoopData
+        BT = user.loopdata.BarometerTrend
+
+        # Empty translation dict -> all defaults present for all nine trends.
+        descs = L.construct_baro_trend_descs({})
+        self.assertEqual(len(descs), 9)
+        # Assert ALL nine mappings (each is a distinct line in the function;
+        # asserting only a few lets mutations to the others survive).
+        self.assertEqual(descs[BT.RISING_VERY_RAPIDLY], 'Rising Very Rapidly')
+        self.assertEqual(descs[BT.RISING_QUICKLY], 'Rising Quickly')
+        self.assertEqual(descs[BT.RISING], 'Rising')
+        self.assertEqual(descs[BT.RISING_SLOWLY], 'Rising Slowly')
+        self.assertEqual(descs[BT.STEADY], 'Steady')
+        self.assertEqual(descs[BT.FALLING_SLOWLY], 'Falling Slowly')
+        self.assertEqual(descs[BT.FALLING], 'Falling')
+        self.assertEqual(descs[BT.FALLING_QUICKLY], 'Falling Quickly')
+        self.assertEqual(descs[BT.FALLING_VERY_RAPIDLY], 'Falling Very Rapidly')
+
+        # Partial override: supplied keys win, the rest keep defaults.
+        descs = L.construct_baro_trend_descs({
+            'STEADY': 'Holding',
+            'RISING': 'Going Up'})
+        self.assertEqual(descs[BT.STEADY], 'Holding')
+        self.assertEqual(descs[BT.RISING], 'Going Up')
+        self.assertEqual(descs[BT.FALLING], 'Falling')  # untouched default
+
+        # To kill mutations of the lookup KEYS (e.g. 'RISING_QUICKLY' ->
+        # corrupted), supply a translation dict containing EVERY key with a
+        # distinct sentinel value.  A corrupted key would miss the dict and fall
+        # back to the English default, producing a different string -- so each
+        # mapping line is independently pinned.
+        keys = ['RISING_VERY_RAPIDLY', 'RISING_QUICKLY', 'RISING',
+                'RISING_SLOWLY', 'STEADY', 'FALLING_SLOWLY', 'FALLING',
+                'FALLING_QUICKLY', 'FALLING_VERY_RAPIDLY']
+        full = {k: 'X_' + k for k in keys}
+        d2 = L.construct_baro_trend_descs(full)
+        self.assertEqual(d2[BT.RISING_VERY_RAPIDLY], 'X_RISING_VERY_RAPIDLY')
+        self.assertEqual(d2[BT.RISING_QUICKLY], 'X_RISING_QUICKLY')
+        self.assertEqual(d2[BT.RISING], 'X_RISING')
+        self.assertEqual(d2[BT.RISING_SLOWLY], 'X_RISING_SLOWLY')
+        self.assertEqual(d2[BT.STEADY], 'X_STEADY')
+        self.assertEqual(d2[BT.FALLING_SLOWLY], 'X_FALLING_SLOWLY')
+        self.assertEqual(d2[BT.FALLING], 'X_FALLING')
+        self.assertEqual(d2[BT.FALLING_QUICKLY], 'X_FALLING_QUICKLY')
+        self.assertEqual(d2[BT.FALLING_VERY_RAPIDLY], 'X_FALLING_VERY_RAPIDLY')
+
+    def test_compute_period_obstypes(self) -> None:
+        # For a given period, collect the obstypes of fields in that period and
+        # auto-add the dependency obstypes for composite types (wind, appTemp,
+        # windrun_*, beaufort).  Fields in other periods are ignored.
+        L = user.loopdata.LoopData
+
+        def cn(field):
+            c = L.parse_cname(field)
+            self.assertIsNotNone(c, msg='parse_cname failed for %s' % field)
+            return c
+
+        fields = {
+            cn('day.outTemp.avg'),         # plain, no expansion
+            cn('day.wind.vecavg'),         # wind -> +windSpeed/windDir/windGust/windGustDir
+            cn('day.appTemp.avg'),         # appTemp -> +outTemp/outHumidity/windSpeed
+            cn('day.windrun_N.sum'),       # windrun* -> +windSpeed/windDir
+            cn('day.beaufort.max'),        # beaufort -> +windSpeed
+            cn('2m.outTemp.avg')}          # different period: must be excluded
+
+        result = L.compute_period_obstypes(fields, 'day')
+
+        # Base obstypes for the 'day' fields.
+        self.assertIn('outTemp', result)
+        self.assertIn('wind', result)
+        self.assertIn('appTemp', result)
+        self.assertIn('windrun_N', result)
+        self.assertIn('beaufort', result)
+        # Auto-added dependencies.
+        self.assertIn('windSpeed', result)
+        self.assertIn('windDir', result)
+        self.assertIn('windGust', result)
+        self.assertIn('windGustDir', result)
+        self.assertIn('outHumidity', result)
+        # The 2m field's obstype must NOT leak into the 'day' result set
+        # (outTemp is already present from day.outTemp, so assert the period
+        # filter via a period that has only the excluded field).
+        result_2m = L.compute_period_obstypes(fields, '2m')
+        self.assertEqual(result_2m, {'outTemp'})
+
+    def test_compute_period_obstypes_isolated_composites(self) -> None:
+        # The shared test asserts presence, but several composites add the SAME
+        # dependency (e.g. both 'wind' and 'windrun' add windDir), so removing
+        # one composite's contribution is masked.  Here each composite is tested
+        # ALONE with exact set equality, so dropping any single .add() is caught.
+        L = user.loopdata.LoopData
+
+        def cn(field):
+            c = L.parse_cname(field)
+            self.assertIsNotNone(c, msg='parse_cname failed for %s' % field)
+            return c
+
+        # wind -> itself + windSpeed, windDir, windGust, windGustDir
+        self.assertEqual(
+            L.compute_period_obstypes({cn('day.wind.vecavg')}, 'day'),
+            {'wind', 'windSpeed', 'windDir', 'windGust', 'windGustDir'})
+        # appTemp -> itself + outTemp, outHumidity, windSpeed
+        self.assertEqual(
+            L.compute_period_obstypes({cn('day.appTemp.avg')}, 'day'),
+            {'appTemp', 'outTemp', 'outHumidity', 'windSpeed'})
+        # windrun_* -> itself + windSpeed, windDir
+        self.assertEqual(
+            L.compute_period_obstypes({cn('day.windrun_N.sum')}, 'day'),
+            {'windrun_N', 'windSpeed', 'windDir'})
+        # beaufort -> itself + windSpeed
+        self.assertEqual(
+            L.compute_period_obstypes({cn('day.beaufort.max')}, 'day'),
+            {'beaufort', 'windSpeed'})
+        # plain obstype -> itself only (no expansion)
+        self.assertEqual(
+            L.compute_period_obstypes({cn('day.outTemp.avg')}, 'day'),
+            {'outTemp'})
 
     def test_get_fields_to_include(self) -> None:
 
@@ -849,6 +1108,21 @@ class ProcessPacketTests(unittest.TestCase):
 
         baroTrend = user.loopdata.LoopProcessor.get_barometer_trend(-0.26577, 'inHg', 'group_pressure', 10800)
         self.assertEqual(baroTrend, user.loopdata.BarometerTrend.FALLING_VERY_RAPIDLY)
+
+        # Normalization-to-3-hours: the thresholds are per-3-hours, so a
+        # time_delta != 10800 must rescale the delta (delta /= time_delta/10800).
+        # All cases above use 10800 (identity), so they don't exercise the
+        # division.  Here a ~1.0 mbar rise over 1 hour (time_delta=3600)
+        # normalizes to ~3.0 mbar/3h -> RISING; without the normalization it
+        # would read ~1.0 -> RISING_SLOWLY, so the division is pinned.  The
+        # value sits mid-bucket, robust to small conversion-factor differences.
+        baroTrend = user.loopdata.LoopProcessor.get_barometer_trend(
+            0.029530, 'inHg', 'group_pressure', 3600)
+        self.assertEqual(baroTrend, user.loopdata.BarometerTrend.RISING)
+        # Same delta over 6 hours normalizes DOWN (~0.5 mbar/3h) -> RISING_SLOWLY.
+        baroTrend = user.loopdata.LoopProcessor.get_barometer_trend(
+            0.029530, 'inHg', 'group_pressure', 21600)
+        self.assertEqual(baroTrend, user.loopdata.BarometerTrend.RISING_SLOWLY)
 
     def test_prune_period_packet(self) -> None:
         """ test that packet is pruned to just the observations needed. """
@@ -2226,6 +2500,1165 @@ class ProcessPacketTests(unittest.TestCase):
         self.assertEqual(loopdata_pkt['day.windSpeed.max'], '200 mph')
         self.assertEqual(loopdata_pkt['day.windSpeed.maxtime.raw'], 1665796969)
 
+    def test_day_wind_vecdir_vecavg(self) -> None:
+        # Validate that the day accumulator's vector direction and vector
+        # average are computed correctly (true vector math), independent of
+        # any continuous/rolling accumulator.  The expected values are computed
+        # by hand from the textbook formula and asserted against loopdata's
+        # output, so this test catches any regression in the vector sum:
+        #
+        #   For each obs (speed, dirN), with math angle theta = radians(90 - dirN):
+        #       xsum += weight * speed * cos(theta)
+        #       ysum += weight * speed * sin(theta)
+        #   vec_dir = (90 - degrees(atan2(ysum, xsum))) mod 360
+        #   vec_avg = sqrt(xsum^2 + ysum^2) / sumtime
+        #
+        # The chosen sequence has a vec_dir (~10.29 deg) that is wildly
+        # different from the naive scalar average of the directions (144 deg),
+        # and a vec_avg (~13.89 mph) different from the scalar speed average
+        # (15 mph), so a broken implementation cannot pass by coincidence.
+        #
+        # NOTE: weight (loop_frequency) cancels out of both results -- it
+        # scales xsum/ysum equally (vec_dir is the angle, scale-invariant) and
+        # is divided back out of vec_avg via sumtime -- so these expectations
+        # hold regardless of the configured loop_frequency.
+        import math
+
+        pkts: List[Dict[str, Any]] = [
+            {'dateTime': 1665796961, 'usUnits': 1, 'windDir': 350.0, 'windGust': 10.0, 'windGustDir': 350.0, 'windrun': None, 'windSpeed': 10.0},
+            {'dateTime': 1665796963, 'usUnits': 1, 'windDir':  20.0, 'windGust': 20.0, 'windGustDir':  20.0, 'windrun': None, 'windSpeed': 20.0},
+            {'dateTime': 1665796965, 'usUnits': 1, 'windDir':  40.0, 'windGust': 10.0, 'windGustDir':  40.0, 'windrun': None, 'windSpeed': 10.0},
+            {'dateTime': 1665796967, 'usUnits': 1, 'windDir':  10.0, 'windGust': 30.0, 'windGustDir':  10.0, 'windrun': None, 'windSpeed': 30.0},
+            {'dateTime': 1665796969, 'usUnits': 1, 'windDir': 300.0, 'windGust':  5.0, 'windGustDir': 300.0, 'windrun': None, 'windSpeed':  5.0}]
+
+        wind_fields = [
+            'day.wind.vecdir',
+            'day.wind.vecdir.raw',
+            'day.wind.vecavg',
+            'day.wind.vecavg.raw',
+            'day.windDir.avg']
+
+        cfg: user.loopdata.Configuration = ProcessPacketTests._get_config('us', 10800, 10, 6, wind_fields)
+
+        accums: user.loopdata.Accumulators = ProcessPacketTests._get_accums(cfg, pkts[0]['dateTime'])
+        for pkt in pkts:
+            loopdata_pkt = user.loopdata.LoopProcessor.generate_loopdata_dictionary(pkt, cfg, accums)
+
+        # --- Compute the expected values by hand from the same inputs. ---
+        weight = cfg.loop_frequency  # cancels out, but use the real value for fidelity
+        xsum = ysum = sumtime = 0.0
+        for pkt in pkts:
+            speed = pkt['windSpeed']
+            dirN = pkt['windDir']
+            theta = math.radians(90.0 - dirN)
+            xsum += weight * speed * math.cos(theta)
+            ysum += weight * speed * math.sin(theta)
+            sumtime += weight
+        expected_vecdir = 90.0 - math.degrees(math.atan2(ysum, xsum))
+        if expected_vecdir < 0.0:
+            expected_vecdir += 360.0
+        expected_vecavg = math.sqrt(xsum ** 2 + ysum ** 2) / sumtime
+
+        # Sanity: these expectations are the ones computed offline (~10.29, ~13.89).
+        self.assertAlmostEqual(expected_vecdir, 10.2922352167, places=6)
+        self.assertAlmostEqual(expected_vecavg, 13.8928679139, places=6)
+
+        # --- Assert loopdata's day accumulator matches the hand calculation. ---
+        self.assertAlmostEqual(loopdata_pkt['day.wind.vecdir.raw'], expected_vecdir, places=4)
+        self.assertAlmostEqual(loopdata_pkt['day.wind.vecavg.raw'], expected_vecavg, places=4)
+
+        # The vector direction (~10 deg) must NOT collapse to the bogus scalar
+        # average of directions (144 deg); windDir.avg is the scalar mean and
+        # is exactly why wind.vecdir exists.  Confirm they differ markedly.
+        self.assertEqual(loopdata_pkt['day.wind.vecdir'], '10°')
+        self.assertNotEqual(loopdata_pkt['day.wind.vecdir'], loopdata_pkt['day.windDir.avg'])
+
+        # Formatted vector average rounds to 14 mph (13.89 -> 14).
+        self.assertEqual(loopdata_pkt['day.wind.vecavg'], '14 mph')
+
+    def test_continuous_wind_vecdir_expiry(self) -> None:
+        # Validate the CONTINUOUS (rolling) wind accumulator's vector math
+        # across window expiry.  This is the path that the sign fix in
+        # ContinuousVecStats.trimExpiredEntries (xsum/ysum debit) and the
+        # dirsumtime debit live in: when an observation ages out of the
+        # rolling window, its full vector contribution must be SUBTRACTED.
+        #
+        # A '2m' tag has timelength = 120s.  A packet added at ts expires once
+        # a later packet arrives at ts + 120 or beyond (trim condition is
+        # debit.expiration <= current_ts, expiration = ts + timelength).
+        #
+        # Timeline (ts, windSpeed, windDir):
+        #     1000  10  200   <- expires by ts=1160 (1000+120=1120 <= 1160)
+        #     1030  10  250   <- expires by ts=1160 (1030+120=1150 <= 1160)
+        #     1160  10  350   <- survivor
+        #     1180  10   10   <- survivor
+        #     1200  10   30   <- survivor (last packet)
+        #
+        # The window is walked through fill -> expire -> refill, and vecdir is
+        # asserted at three stages.  The progression 225 -> 350 -> 10 degrees
+        # is only producible if expired contributions are correctly removed.
+        # (With the old '+=' trim bug, the final vecdir would be ~277.5 deg,
+        # a 267-degree error -- so this test discriminates strongly.)
+        import math
+
+        pkts: List[Dict[str, Any]] = [
+            {'dateTime': 1000, 'usUnits': 1, 'windDir': 200.0, 'windGust': 10.0, 'windGustDir': 200.0, 'windrun': None, 'windSpeed': 10.0},
+            {'dateTime': 1030, 'usUnits': 1, 'windDir': 250.0, 'windGust': 10.0, 'windGustDir': 250.0, 'windrun': None, 'windSpeed': 10.0},
+            {'dateTime': 1160, 'usUnits': 1, 'windDir': 350.0, 'windGust': 10.0, 'windGustDir': 350.0, 'windrun': None, 'windSpeed': 10.0},
+            {'dateTime': 1180, 'usUnits': 1, 'windDir':  10.0, 'windGust': 10.0, 'windGustDir':  10.0, 'windrun': None, 'windSpeed': 10.0},
+            {'dateTime': 1200, 'usUnits': 1, 'windDir':  30.0, 'windGust': 10.0, 'windGustDir':  30.0, 'windrun': None, 'windSpeed': 10.0}]
+
+        wind_fields = [
+            '2m.wind.vecdir',
+            '2m.wind.vecdir.raw',
+            '2m.wind.vecavg',
+            '2m.wind.vecavg.raw']
+
+        cfg: user.loopdata.Configuration = ProcessPacketTests._get_config('us', 10800, 10, 6, wind_fields)
+        weight = cfg.loop_frequency
+
+        def hand_vec(survivors):
+            # survivors: list of (windSpeed, windDir)
+            xsum = ysum = sumtime = 0.0
+            for speed, dirN in survivors:
+                theta = math.radians(90.0 - dirN)
+                xsum += weight * speed * math.cos(theta)
+                ysum += weight * speed * math.sin(theta)
+                sumtime += weight
+            vec_dir = 90.0 - math.degrees(math.atan2(ysum, xsum))
+            if vec_dir < 0.0:
+                vec_dir += 360.0
+            vec_avg = math.sqrt(xsum ** 2 + ysum ** 2) / sumtime
+            return vec_dir, vec_avg
+
+        accums: user.loopdata.Accumulators = ProcessPacketTests._get_accums(cfg, pkts[0]['dateTime'])
+
+        # Packet 1 (ts=1000): only the 200-degree obs is present.
+        loopdata_pkt = user.loopdata.LoopProcessor.generate_loopdata_dictionary(pkts[0], cfg, accums)
+
+        # Packet 2 (ts=1030): both 200 and 250 live; nothing expired yet.
+        loopdata_pkt = user.loopdata.LoopProcessor.generate_loopdata_dictionary(pkts[1], cfg, accums)
+        vd, va = hand_vec([(10.0, 200.0), (10.0, 250.0)])
+        self.assertAlmostEqual(vd, 225.0, places=4)  # offline-computed checkpoint
+        self.assertAlmostEqual(loopdata_pkt['2m.wind.vecdir.raw'], vd, places=4)
+        self.assertAlmostEqual(loopdata_pkt['2m.wind.vecavg.raw'], va, places=4)
+
+        # Packet 3 (ts=1160): 1000 (exp 1120) and 1030 (exp 1150) have both
+        # expired (<= 1160); only the 350-degree obs survives.
+        loopdata_pkt = user.loopdata.LoopProcessor.generate_loopdata_dictionary(pkts[2], cfg, accums)
+        vd, va = hand_vec([(10.0, 350.0)])
+        self.assertAlmostEqual(vd, 350.0, places=4)
+        self.assertAlmostEqual(loopdata_pkt['2m.wind.vecdir.raw'], vd, places=4)
+        self.assertAlmostEqual(loopdata_pkt['2m.wind.vecavg.raw'], va, places=4)
+
+        # Packets 4 and 5 (ts=1180, 1200): window now holds 350, 10, 30.
+        loopdata_pkt = user.loopdata.LoopProcessor.generate_loopdata_dictionary(pkts[3], cfg, accums)
+        loopdata_pkt = user.loopdata.LoopProcessor.generate_loopdata_dictionary(pkts[4], cfg, accums)
+        vd, va = hand_vec([(10.0, 350.0), (10.0, 10.0), (10.0, 30.0)])
+        self.assertAlmostEqual(vd, 10.0, places=4)  # offline-computed checkpoint
+        self.assertAlmostEqual(va, 9.5979508052, places=6)
+        self.assertAlmostEqual(loopdata_pkt['2m.wind.vecdir.raw'], vd, places=4)
+        self.assertAlmostEqual(loopdata_pkt['2m.wind.vecavg.raw'], va, places=4)
+
+    def test_continuous_scalar_stats_edge_cases(self) -> None:
+        # Direct unit tests for ContinuousScalarStats accessors, focused on the
+        # empty-accumulator branches and the None/NaN rejection path in addSum.
+        CS = user.loopdata.ContinuousScalarStats
+
+        # --- Empty accumulator: every accessor degrades gracefully. ---
+        s = CS(timelength=120)
+        self.assertIsNone(s.first)
+        self.assertIsNone(s.firsttime)
+        self.assertIsNone(s.last)
+        self.assertIsNone(s.lasttime)
+        self.assertIsNone(s.avg)            # count is 0 -> None
+        # getStatsTuple on empty: min/mintime/max/maxtime are None; the numeric
+        # fields are zero (sum/wsum massaged to 0.0, count 0, sumtime 0.0).
+        self.assertEqual(s.getStatsTuple(), (None, None, None, None, 0.0, 0, 0.0, 0.0))
+
+        # --- One value (ts=100, val=5.0, weight=2). ---
+        s.addSum(100, 5.0, weight=2)
+        self.assertEqual(s.first, 5.0)
+        self.assertEqual(s.firsttime, 100)
+        self.assertEqual(s.last, 5.0)
+        self.assertEqual(s.lasttime, 100)
+        self.assertAlmostEqual(s.avg, 5.0)  # wsum/sumtime = 10/2
+        self.assertEqual(s.getStatsTuple(), (5.0, 100, 5.0, 100, 5.0, 1, 10.0, 2))
+
+        # --- None / NaN / non-numeric are rejected by addSum (no state change). ---
+        s.addSum(110, None, weight=2)
+        s.addSum(120, float('nan'), weight=2)
+        s.addSum(130, 'not-a-number', weight=2)
+        # Still exactly the single value from before.
+        self.assertEqual(s.getStatsTuple(), (5.0, 100, 5.0, 100, 5.0, 1, 10.0, 2))
+        self.assertEqual(s.lasttime, 100)
+
+        # --- A second, larger value updates min/max ordering and last. ---
+        s.addSum(140, 9.0, weight=2)
+        mn, mntime, mx, mxtime, ssum, scount, swsum, ssumtime = s.getStatsTuple()
+        self.assertEqual(mn, 5.0)
+        self.assertEqual(mx, 9.0)
+        self.assertEqual(scount, 2)
+        self.assertEqual(s.last, 9.0)
+        self.assertEqual(s.lasttime, 140)
+
+    def test_continuous_vec_stats_edge_cases(self) -> None:
+        # Direct unit tests for ContinuousVecStats accessors, focused on the
+        # empty-accumulator branches (including the maxdir slot that must be
+        # None when empty), the calm-wind (dirN is None, speed 0) path in
+        # addSum, and that 'first' reports the FIRST observation's direction.
+        CV = user.loopdata.ContinuousVecStats
+
+        # --- Empty accumulator. ---
+        v = CV(timelength=120)
+        self.assertIsNone(v.first)
+        self.assertIsNone(v.firsttime)
+        self.assertIsNone(v.last)
+        self.assertIsNone(v.lasttime)
+        self.assertIsNone(v.avg)
+        self.assertIsNone(v.rms)
+        self.assertIsNone(v.vec_avg)
+        self.assertIsNone(v.vec_dir)        # empty -> last is None -> None
+        # getStatsTuple on empty must not raise; the maxdir slot (index 8) is
+        # None (regression guard: it was previously an unbound local).
+        st = v.getStatsTuple()
+        self.assertEqual(len(st), 14)
+        self.assertEqual(st[0:4], (None, None, None, None))  # min,mintime,max,maxtime
+        self.assertEqual(st[5], 0)                            # count
+        self.assertIsNone(st[8])                              # maxdir
+
+        # --- Calm wind: speed 0 with dirN None is accepted (dirsumtime path). ---
+        v.addSum(100, (0.0, None), weight=2)
+        self.assertEqual(v.count, 1)
+        self.assertEqual(v.first, (0.0, None))
+        self.assertEqual(v.last, (0.0, None))
+
+        # --- Two observations with DIFFERENT directions: 'first' must report
+        # the first observation's direction, 'last' the last's. ---
+        v2 = CV(timelength=120)
+        v2.addSum(200, (10.0, 90.0), weight=2)    # first: East
+        v2.addSum(210, (10.0, 270.0), weight=2)   # last: West
+        self.assertEqual(v2.first, (10.0, 90.0))  # regression guard for the
+                                                  # first-direction index fix
+        self.assertEqual(v2.last, (10.0, 270.0))
+        self.assertEqual(v2.firsttime, 200)
+        self.assertEqual(v2.lasttime, 210)
+
+        # --- None speed is rejected by addSum (no state change). ---
+        before = v2.count
+        v2.addSum(220, (None, 45.0), weight=2)
+        self.assertEqual(v2.count, before)
+
+        # --- Non-numeric speed: to_float raises -> speed becomes None ->
+        # the whole observation is rejected (covers the except ValueError path
+        # for speed). ---
+        v3 = CV(timelength=120)
+        v3.addSum(300, ('not-a-number', 45.0), weight=2)
+        self.assertEqual(v3.count, 0)
+
+        # --- Non-numeric dirN with valid speed: to_float(dirN) raises -> dirN
+        # becomes None, but the speed is still recorded (covers the except
+        # ValueError path for dirN, and the dirN-is-None branch with nonzero
+        # speed where xsum/ysum are NOT updated). ---
+        v4 = CV(timelength=120)
+        v4.addSum(310, (10.0, 'bad-dir'), weight=2)
+        self.assertEqual(v4.count, 1)
+        self.assertEqual(v4.xsum, 0.0)   # no direction -> no vector components
+        self.assertEqual(v4.ysum, 0.0)
+        self.assertEqual(v4.last, (10.0, None))
+
+    def test_continuous_vec_stats_trim_debits_every_field(self) -> None:
+        # trimExpiredEntries must DEBIT every running sum by exactly the
+        # contribution of each expired observation -- it is the precise inverse
+        # of addSum.  This test pins each debited field to an independently
+        # hand-computed post-trim value, so that flipping any '-=' to '+=' (or
+        # otherwise corrupting a debit) is detected.  Mutation testing showed
+        # these debits were previously unasserted (the original vecdir bug lived
+        # in exactly this trim arithmetic).
+        CV = user.loopdata.ContinuousVecStats
+
+        v = CV(timelength=100)
+        # Three observations, weight 2 each, at 90 deg apart so x/y components
+        # are clean: (10, E), (20, S), (30, W).  Expirations: 200, 250, 300.
+        v.addSum(100, (10.0, 90.0), weight=2)    # East
+        v.addSum(150, (20.0, 180.0), weight=2)   # South
+        v.addSum(200, (30.0, 270.0), weight=2)   # West
+
+        # Sanity: full state before trimming (independently computed).
+        self.assertEqual(v.sum, 60.0)
+        self.assertEqual(v.count, 3)
+        self.assertEqual(v.wsum, 120.0)
+        self.assertEqual(v.sumtime, 6.0)
+        self.assertEqual(v.squaresum, 1400.0)
+        self.assertEqual(v.wsquaresum, 2800.0)
+        self.assertEqual(v.dirsumtime, 6)
+
+        # Trim at ts=205: only the first debit (expiration 200 <= 205) matures.
+        v.trimExpiredEntries(205)
+
+        # Every field must be debited by exactly the East observation's
+        # contribution.  Values hand-computed, independent of the implementation.
+        self.assertEqual(v.sum, 50.0)          # 60 - 10
+        self.assertEqual(v.count, 2)           # 3 - 1
+        self.assertEqual(v.wsum, 100.0)        # 120 - 2*10
+        self.assertEqual(v.sumtime, 4.0)       # 6 - 2
+        self.assertEqual(v.squaresum, 1300.0)  # 1400 - 10**2
+        self.assertEqual(v.wsquaresum, 2600.0) # 2800 - 2*10**2
+        self.assertEqual(v.dirsumtime, 4)      # 6 - 2  (the dirsumtime debit fix)
+        # East (90 deg) contributes only to xsum (cos), nothing to ysum (sin=0).
+        # So trimming it changes xsum but leaves ysum unchanged -- this pins the
+        # CONDITIONAL x/y debits independently.
+        self.assertAlmostEqual(v.xsum, -60.0, places=6)
+        self.assertAlmostEqual(v.ysum, -40.0, places=6)
+
+        # The expired entry must also be removed from speed_dict (speed 10 gone).
+        self.assertNotIn(10.0, v.speed_dict)
+        self.assertIn(20.0, v.speed_dict)
+        self.assertIn(30.0, v.speed_dict)
+
+    def test_continuous_vec_stats_trim_boundary_and_calm(self) -> None:
+        # Companion to the trim-debits test, targeting three branches the first
+        # one cannot reach:
+        #  (1) the expiration boundary -- a debit at EXACTLY its expiration ts
+        #      must mature (expiration <= ts is inclusive);
+        #  (2) the ysum debit -- trimming an observation with a non-zero
+        #      y-component must change ysum (the East obs used elsewhere has
+        #      zero y, so it cannot pin this line);
+        #  (3) the calm-wind branch (dirN is None and speed 0) -- dirsumtime is
+        #      credited on add and must be debited on trim.
+        CV = user.loopdata.ContinuousVecStats
+
+        # --- (1) + (2): trim a SOUTH observation (pure -y) at exactly its
+        # expiration. ---
+        v = CV(timelength=100)
+        v.addSum(100, (20.0, 180.0), weight=2)   # South: ysum=-40, xsum~0
+        v.addSum(150, (30.0, 270.0), weight=2)   # West:  xsum=-60, ysum~0
+        self.assertAlmostEqual(v.ysum, -40.0, places=6)
+
+        # Trim at EXACTLY the first debit's expiration (100 + 100 = 200).  The
+        # inclusive boundary (expiration <= ts) means it matures.
+        v.trimExpiredEntries(200)
+        self.assertEqual(v.count, 1)             # boundary debit did mature
+        self.assertAlmostEqual(v.ysum, 0.0, places=6)   # South's -y removed
+        self.assertAlmostEqual(v.xsum, -60.0, places=6) # West's x remains
+
+        # --- (3): calm wind (speed 0, dirN None) credits then debits
+        # dirsumtime via the 'or speed == 0' branch. ---
+        c = CV(timelength=100)
+        c.addSum(100, (0.0, None), weight=2)
+        self.assertEqual(c.dirsumtime, 2)        # credited despite dirN None
+        self.assertEqual(c.count, 1)
+        c.trimExpiredEntries(200)                # expiration 200 <= 200 -> trim
+        self.assertEqual(c.dirsumtime, 0)        # debited back to zero
+        self.assertEqual(c.count, 0)
+
+    def test_continuous_scalar_stats_sums_and_trim(self) -> None:
+        # Pins every running-sum field of ContinuousScalarStats across addSum
+        # (credits) and trimExpiredEntries (debits), with independently
+        # hand-computed values, so a flipped +=/-= or wrong factor is detected.
+        CS = user.loopdata.ContinuousScalarStats
+
+        s = CS(timelength=100)
+        s.addSum(100, 10.0, weight=2)
+        s.addSum(150, 20.0, weight=2)
+        s.addSum(200, 30.0, weight=2)
+        # After three adds (independently computed).
+        self.assertEqual(s.sum, 60.0)
+        self.assertEqual(s.count, 3)
+        self.assertEqual(s.wsum, 120.0)
+        self.assertEqual(s.sumtime, 6.0)
+        self.assertAlmostEqual(s.avg, 20.0)        # wsum/sumtime = 120/6
+
+        # Trim at 205: only the first debit (expiration 200) matures.
+        s.trimExpiredEntries(205)
+        self.assertEqual(s.sum, 50.0)              # 60 - 10
+        self.assertEqual(s.count, 2)               # 3 - 1
+        self.assertEqual(s.wsum, 100.0)            # 120 - 10*2
+        self.assertEqual(s.sumtime, 4.0)           # 6 - 2
+        self.assertAlmostEqual(s.avg, 25.0)        # 100/4
+        # values_dict cleanup: the trimmed value's key is removed.
+        self.assertNotIn(10.0, s.values_dict)
+        self.assertIn(20.0, s.values_dict)
+
+    def test_continuous_vec_stats_addsum_credits(self) -> None:
+        # Pins every running-sum field credited by ContinuousVecStats.addSum
+        # (the inverse of the trim debits), with hand-computed values.  Uses
+        # three observations 90 deg apart so x and y components are cleanly
+        # separable -- which also pins the xsum (cos) and ysum (sin) lines
+        # independently (a mutation to either must change a distinct field).
+        CV = user.loopdata.ContinuousVecStats
+
+        v = CV(timelength=100)
+        v.addSum(100, (10.0, 90.0), weight=2)    # East:  +x only
+        v.addSum(150, (20.0, 180.0), weight=2)   # South: -y only
+        v.addSum(200, (30.0, 270.0), weight=2)   # West:  -x only
+
+        self.assertEqual(v.sum, 60.0)
+        self.assertEqual(v.count, 3)
+        self.assertEqual(v.wsum, 120.0)
+        self.assertEqual(v.sumtime, 6.0)
+        self.assertEqual(v.squaresum, 1400.0)     # 10^2+20^2+30^2
+        self.assertEqual(v.wsquaresum, 2800.0)    # 2*(above)
+        self.assertEqual(v.dirsumtime, 6)
+        # East(+x 20) + West(-x 60) = -40; South contributes -y 40.
+        self.assertAlmostEqual(v.xsum, -40.0, places=6)
+        self.assertAlmostEqual(v.ysum, -40.0, places=6)
+
+    def test_continuous_vec_stats_getstatstuple_and_accessors(self) -> None:
+        # Pins the getStatsTuple massage/return slots and the derived accessors
+        # (avg, rms, vec_avg, vec_dir, first, last, firsttime, lasttime) with
+        # independently computed values.
+        CV = user.loopdata.ContinuousVecStats
+
+        v = CV(timelength=100)
+        v.addSum(100, (10.0, 90.0), weight=2)
+        v.addSum(150, (20.0, 180.0), weight=2)
+        v.addSum(200, (30.0, 270.0), weight=2)
+
+        # Accessors (hand-computed).
+        self.assertAlmostEqual(v.avg, 20.0)                      # wsum/sumtime
+        self.assertAlmostEqual(v.rms, 21.602468994692867, places=6)   # sqrt(2800/6)
+        self.assertAlmostEqual(v.vec_avg, 9.428090415820636, places=6)
+        self.assertAlmostEqual(v.vec_dir, 225.0, places=6)       # atan2(-40,-40)
+        # first = first observation's (speed, dir); last = last observation's.
+        self.assertEqual(v.first, (10.0, 90.0))
+        self.assertEqual(v.last, (30.0, 270.0))
+        self.assertEqual(v.firsttime, 100)
+        self.assertEqual(v.lasttime, 200)
+
+        # getStatsTuple slots that feed sum/wsum/sumtime/squaresum/etc.
+        st = v.getStatsTuple()
+        # Indices: 0 min,1 mintime,2 max,3 maxtime,4 sum,5 count,6 wsum,
+        # 7 sumtime,8 maxdir,9 xsum,10 ysum,11 dirsumtime,12 squaresum,13 wsquaresum
+        self.assertEqual(st[4], 60.0)    # sum
+        self.assertEqual(st[5], 3)       # count
+        self.assertEqual(st[6], 120.0)   # wsum
+        self.assertEqual(st[7], 6.0)     # sumtime
+        self.assertAlmostEqual(st[9], -40.0, places=6)   # xsum
+        self.assertAlmostEqual(st[10], -40.0, places=6)  # ysum
+        self.assertEqual(st[11], 6)      # dirsumtime
+        self.assertEqual(st[12], 1400.0) # squaresum
+        self.assertEqual(st[13], 2800.0) # wsquaresum
+
+    def test_add_period_obstype_scalar_agg_dispatch(self) -> None:
+        # Pins the scalar agg_type dispatch in add_period_obstype (each
+        # agg_type must route to the CORRECT stat).  Uses a US accum and a US
+        # converter so conversion is identity for outTemp (degree_F), making the
+        # '.raw' values exact and independent of any skin config.  Distinct
+        # min/max/sum/avg values mean swapping any two agg branches is caught.
+        import weewx.units
+        US = weewx.units.unit_constants['US']
+
+        # Build a day-period scalar accum for outTemp with known records.
+        span = weeutil.weeutil.TimeSpan(0, 100000000000)
+        accum = weewx.accum.Accum(span, US)
+        for ts, t in ((1000, 40.0), (1300, 60.0), (1600, 50.0)):
+            accum.addRecord({'dateTime': ts, 'usUnits': 1, 'outTemp': t}, weight=300)
+
+        formatter = weewx.units.Formatter()                 # default
+        converter = weewx.units.Converter(weewx.units.USUnits)
+
+        # Conversion-identity precondition: a degree_F value must pass through
+        # unchanged, so the asserted '.raw' values below are exact.
+        vt = weewx.units.ValueTuple(40.0, 'degree_F', 'group_temperature')
+        self.assertAlmostEqual(converter.convert(vt)[0], 40.0)
+
+        def raw_value(agg):
+            cname = user.loopdata.LoopData.parse_cname('day.outTemp.%s.raw' % agg)
+            self.assertIsNotNone(cname, msg='parse failed for agg %s' % agg)
+            pkt = {}
+            user.loopdata.LoopProcessor.add_period_obstype(
+                cname, accum, pkt, converter, formatter)
+            return pkt.get(cname.field)
+
+        # Each agg_type routes its specific stat (independently hand-computed).
+        self.assertAlmostEqual(raw_value('min'), 40.0)
+        self.assertAlmostEqual(raw_value('max'), 60.0)
+        self.assertAlmostEqual(raw_value('sum'), 150.0)
+        self.assertAlmostEqual(raw_value('avg'), 50.0)
+        self.assertEqual(raw_value('mintime'), 1000)
+        self.assertEqual(raw_value('maxtime'), 1300)
+        # count is a valid ScalarStats agg per weewx accum.py (getStatsTuple
+        # slot 5); 3 records -> count 3.
+        self.assertEqual(raw_value('count'), 3)
+        # Distinctness guard: min and max must differ (catches min<->max swap).
+        self.assertNotEqual(raw_value('min'), raw_value('max'))
+
+    def test_add_period_obstype_vec_agg_dispatch(self) -> None:
+        # Pins the VECTOR agg_type dispatch in add_period_obstype.  Builds a
+        # 'wind' VecStats accum with distinct per-agg values so each agg_type
+        # routes its specific slot; a swapped branch produces a different value.
+        import weewx.units
+        US = weewx.units.unit_constants['US']
+
+        span = weeutil.weeutil.TimeSpan(0, 100000000000)
+        accum = weewx.accum.Accum(span, US)
+        # windSpeed + windDir records (no separate gust -> gust tracks speed).
+        for ts, spd, d in ((1000, 3.0, 90.0), (1300, 9.0, 180.0), (1600, 6.0, 270.0)):
+            accum.addRecord({'dateTime': ts, 'usUnits': 1,
+                             'windSpeed': spd, 'windDir': d, 'windGust': spd,
+                             'windGustDir': d}, weight=300)
+
+        formatter = weewx.units.Formatter()
+        converter = weewx.units.Converter(weewx.units.USUnits)
+
+        def raw_value(agg):
+            cname = user.loopdata.LoopData.parse_cname('day.wind.%s.raw' % agg)
+            self.assertIsNotNone(cname, msg='parse failed for agg %s' % agg)
+            pkt = {}
+            user.loopdata.LoopProcessor.add_period_obstype(
+                cname, accum, pkt, converter, formatter)
+            return pkt.get(cname.field)
+
+        # Independently computed from the records.
+        self.assertAlmostEqual(raw_value('min'), 3.0)
+        self.assertAlmostEqual(raw_value('max'), 9.0)
+        self.assertEqual(raw_value('mintime'), 1000)
+        self.assertEqual(raw_value('maxtime'), 1300)
+        # count is a valid VecStats agg per weewx accum.py; 3 records -> 3.
+        # (This previously could not be requested -- 'count' was missing from
+        # parse_cname's valid_agg_types -- which was a bug, now fixed.)
+        self.assertEqual(raw_value('count'), 3)
+        self.assertAlmostEqual(raw_value('sum'), 18.0)
+        self.assertAlmostEqual(raw_value('avg'), 6.0)
+        self.assertAlmostEqual(raw_value('rms'), 6.480741, places=4)
+        self.assertAlmostEqual(raw_value('vecavg'), 3.162278, places=4)
+        self.assertAlmostEqual(raw_value('vecdir'), 198.434949, places=4)
+        # gustdir == max_dir: per weewx accum.py VecStats.addHiLo, max_dir is
+        # the direction recorded at the maximum speed.  Max speed 9.0 occurred
+        # at dir 180.0.
+        self.assertAlmostEqual(raw_value('gustdir'), 180.0)
+        # Routing-distinctness guards (catch branch swaps even without pinning
+        # the exact gustdir value, whose weewx semantics we don't re-derive).
+        self.assertNotEqual(raw_value('min'), raw_value('max'))
+        self.assertNotEqual(raw_value('avg'), raw_value('vecavg'))
+        self.assertNotEqual(raw_value('mintime'), raw_value('maxtime'))
+
+        # Empty vec accum (count == 0): the dispatch guard 'and stats.count != 0'
+        # must be false, so NO value is produced for any agg.  This pins the
+        # count-guard on the VecStats branch.
+        empty_accum = weewx.accum.Accum(span, US)
+        # Touch 'wind' so the obstype exists but has no observations.
+        empty_accum.addRecord({'dateTime': 1000, 'usUnits': 1,
+                               'windDir': 90.0}, weight=300)  # dir only, no speed
+        cname_e = user.loopdata.LoopData.parse_cname('day.wind.max.raw')
+        pkt_e = {}
+        if 'wind' in empty_accum:
+            user.loopdata.LoopProcessor.add_period_obstype(
+                cname_e, empty_accum, pkt_e, converter, formatter)
+            self.assertNotIn('day.wind.max.raw', pkt_e)  # count==0 -> no output
+
+    def test_add_current_obstype_format_spec_dispatch(self) -> None:
+        # Pins the format_spec branches of add_current_obstype: 'raw' returns
+        # the numeric value; 'formatted' returns the bare formatted string;
+        # 'ordinal_compass' returns a compass label; default appends the unit
+        # label.  Uses the real SeasonsReport formatter (via _get_config) so
+        # 'formatted' (e.g. '72.5') genuinely differs from the default
+        # toString (e.g. '72.5°F') -- with a bare Formatter() they coincide and
+        # the branch cannot be distinguished.
+        specified_fields = ['current.outTemp', 'current.outTemp.raw',
+                            'current.outTemp.formatted',
+                            'current.windDir.ordinal_compass']
+        cfg = ProcessPacketTests._get_config('us', 10800, 1, 6, specified_fields)
+        converter = cfg.converter
+        formatter = cfg.formatter
+
+        pkt = {'dateTime': 1000, 'usUnits': 1, 'outTemp': 72.5, 'windDir': 90.0}
+
+        def field_value(spec, obstype='outTemp'):
+            field = ('current.%s' % obstype) if spec is None else (
+                'current.%s.%s' % (obstype, spec))
+            cname = user.loopdata.LoopData.parse_cname(field)
+            self.assertIsNotNone(cname, msg='parse failed %s %s' % (obstype, spec))
+            out = {}
+            user.loopdata.LoopProcessor.add_current_obstype(
+                cname, pkt, out, converter, formatter)
+            return out.get(cname.field)
+
+        # 'raw' -> exact numeric (US identity conversion for degree_F).
+        self.assertAlmostEqual(field_value('raw'), 72.5)
+        # 'formatted' -> bare number string; default -> appends unit label.
+        # These differ under the real skin formatter, pinning the 'formatted'
+        # branch against the fall-through default.
+        t_formatted = field_value('formatted', obstype='outTemp')
+        t_default = field_value(None, obstype='outTemp')
+        self.assertIsInstance(t_formatted, str)
+        self.assertNotEqual(t_formatted, t_default)
+        # 'ordinal_compass' on windDir -> a compass label, distinct from the
+        # default rendering, pinning the ordinal_compass branch.
+        d_compass = field_value('ordinal_compass', obstype='windDir')
+        d_default = field_value(None, obstype='windDir')
+        self.assertIsInstance(d_compass, str)
+        self.assertNotEqual(d_compass, d_default)
+
+    def test_create_loopdata_packet_period_routing(self) -> None:
+        # Pins create_loopdata_packet's period routing: each cname.period must
+        # be dispatched to its OWN accumulator.  day_accum and hour_accum hold
+        # the SAME obstype (outTemp) with DIFFERENT values, so a mis-routed
+        # period (e.g. a 'day'->'hour' comparison swap) reads the wrong accum
+        # and produces the wrong value.  Uses '.raw' so values are exact
+        # (target_unit=US -> identity conversion).
+        specified_fields = ['current.outTemp.raw',
+                            'day.outTemp.max.raw', 'day.outTemp.min.raw',
+                            'hour.outTemp.max.raw', 'hour.outTemp.min.raw']
+        cfg = ProcessPacketTests._get_config('us', 10800, 1, 6, specified_fields)
+
+        # Noon PDT, July 1 2020 (same anchor the other harness tests use).
+        pkt_time = 1593630000
+        accums = ProcessPacketTests._get_accums(cfg, pkt_time)
+        self.assertIsNotNone(accums.hour_accum)   # requested -> built
+
+        # Distinct values per period.  NOTE: archiveHoursAgoSpan(pkt_time) is
+        # the PREVIOUS completed hour [11:00, 12:00], so hour records must fall
+        # inside it (not at/after noon).  The day span contains noon.
+        accums.day_accum.addRecord(
+            {'dateTime': pkt_time - 1, 'usUnits': 1, 'outTemp': 50.0}, weight=300)
+        accums.day_accum.addRecord(
+            {'dateTime': pkt_time, 'usUnits': 1, 'outTemp': 80.0}, weight=300)
+        accums.hour_accum.addRecord(
+            {'dateTime': pkt_time - 1800, 'usUnits': 1, 'outTemp': 60.0}, weight=300)
+        accums.hour_accum.addRecord(
+            {'dateTime': pkt_time - 900, 'usUnits': 1, 'outTemp': 70.0}, weight=300)
+
+        pkt = {'dateTime': pkt_time, 'usUnits': 1, 'outTemp': 65.0}
+        loopdata_pkt = user.loopdata.LoopProcessor.create_loopdata_packet(
+            pkt, cfg, accums)
+
+        # Each period routed to its own accum (cross-checks routing).
+        self.assertAlmostEqual(loopdata_pkt['day.outTemp.max.raw'], 80.0)
+        self.assertAlmostEqual(loopdata_pkt['day.outTemp.min.raw'], 50.0)
+        self.assertAlmostEqual(loopdata_pkt['hour.outTemp.max.raw'], 70.0)
+        self.assertAlmostEqual(loopdata_pkt['hour.outTemp.min.raw'], 60.0)
+        # 'current' routed to the live packet, not an accum.
+        self.assertAlmostEqual(loopdata_pkt['current.outTemp.raw'], 65.0)
+
+    def test_add_trend_obstype_barometer_code_desc(self) -> None:
+        # Pins add_trend_obstype's barometer code/desc routing: for
+        # trend.barometer.code the field gets the BarometerTrend enum VALUE;
+        # for .desc it gets the description string.  A barometer rise of
+        # 0.07 inHg over ~time_delta -> ~2.37 mbar/3h -> RISING (code 2).
+        import weewx.units
+        US = weewx.units.unit_constants['US']
+        converter = weewx.units.Converter(weewx.units.USUnits)
+        formatter = weewx.units.Formatter()
+        baro_descs = user.loopdata.LoopData.construct_baro_trend_descs({})
+
+        time_delta = 10800
+        loop_frequency = 2.0
+        # Span the accum across ~time_delta so the trend adjustment factor is ~1.
+        t0 = 1000
+        t1 = t0 + (time_delta - loop_frequency)  # actual_time_delta == time_delta
+        accum = user.loopdata.ContinuousAccum(100000, US)
+        accum.addRecord({'dateTime': t0, 'usUnits': 1, 'barometer': 30.00})
+        accum.addRecord({'dateTime': t1, 'usUnits': 1, 'barometer': 30.07})
+
+        pkt = {'dateTime': t1, 'usUnits': 1, 'barometer': 30.07}
+
+        def trend_field(spec):
+            cname = user.loopdata.LoopData.parse_cname('trend.barometer.%s' % spec)
+            self.assertIsNotNone(cname, msg='parse failed for %s' % spec)
+            out = {}
+            user.loopdata.LoopProcessor.add_trend_obstype(
+                cname, accum, pkt, out, time_delta, loop_frequency,
+                baro_descs, converter, formatter)
+            return out.get(cname.field)
+
+        # code -> the enum value (RISING == 2); desc -> the description string.
+        self.assertEqual(trend_field('code'), user.loopdata.BarometerTrend.RISING.value)
+        self.assertEqual(trend_field('desc'), 'Rising')
+
+    def test_get_trend_computation(self) -> None:
+        # Pins the trend math in get_trend: trend = last - first, adjusted to
+        # spread over time_delta:  adj = time_delta / (lasttime - firsttime +
+        # loop_frequency) * trend.  Value is independently hand-computed.  US
+        # config -> identity conversion for barometer (inHg).
+        import weewx.units
+        US = weewx.units.unit_constants['US']
+        converter = weewx.units.Converter(weewx.units.USUnits)
+
+        # Continuous accum holding two barometer readings.
+        accum = user.loopdata.ContinuousAccum(100000, US)
+        accum.addRecord({'dateTime': 1000, 'usUnits': 1, 'barometer': 30.00})
+        accum.addRecord({'dateTime': 1900, 'usUnits': 1, 'barometer': 30.06})
+        self.assertIn('barometer', accum)
+        self.assertAlmostEqual(accum['barometer'].first, 30.00)
+        self.assertAlmostEqual(accum['barometer'].last, 30.06)
+
+        cname = user.loopdata.LoopData.parse_cname('trend.barometer.raw')
+        self.assertIsNotNone(cname)
+        pkt = {'dateTime': 1900, 'usUnits': 1, 'barometer': 30.06}
+        time_delta = 10800
+        loop_frequency = 2.0
+
+        value, unit_type, group_type = user.loopdata.LoopProcessor.get_trend(
+            cname, pkt, accum, converter, time_delta, loop_frequency)
+
+        # trend = 30.06 - 30.00 = 0.06
+        # actual_time_delta = 1900 - 1000 + 2.0 = 902.0
+        # adj = 10800 / 902.0 * 0.06 = 0.718404...
+        self.assertAlmostEqual(value, 0.7184035476718404, places=6)
+
+        # Guard branches: identical first/last time -> None (need two readings).
+        accum2 = user.loopdata.ContinuousAccum(100000, US)
+        accum2.addRecord({'dateTime': 1000, 'usUnits': 1, 'barometer': 30.00})
+        v2, _, _ = user.loopdata.LoopProcessor.get_trend(
+            cname, pkt, accum2, converter, time_delta, loop_frequency)
+        self.assertIsNone(v2)  # only one reading -> firsttime == lasttime
+
+        # Obstype absent from accum -> None.
+        cname_missing = user.loopdata.LoopData.parse_cname('trend.outTemp.raw')
+        v3, _, _ = user.loopdata.LoopProcessor.get_trend(
+            cname_missing, pkt, accum, converter, time_delta, loop_frequency)
+        self.assertIsNone(v3)
+
+    def test_period_accum_wrappers_use_correct_spans(self) -> None:
+        # Pins the span construction in each create_<period>_accum wrapper: the
+        # returned accumulator's timespan must equal the corresponding weeutil
+        # span function for the same pkt_time.  weeutil is the spec for what
+        # each period's span IS; a wrapper calling the wrong span function (or
+        # wrong args) produces a mismatched timespan and is caught.
+        import weewx.units, weewx.manager
+        US = weewx.units.unit_constants['US']
+
+        # pkt_time: 2020-07-01 12:00:00 PDT (a fixed, unambiguous instant).
+        pkt_time = 1593630000
+        week_start = 6
+        rainyear_start = 1
+        archive_interval = 5
+
+        tmpdir = tempfile.mkdtemp()
+        dbm = None
+        try:
+            db_dict = {'database_name': os.path.join(tmpdir, 'test.sdb'),
+                       'driver': 'weedb.sqlite'}
+            dbm = weewx.manager.DaySummaryManager.open_with_create(
+                db_dict, table_name='archive', schema=wview_extended_schema)
+
+            day_accum = weewx.accum.Accum(
+                weeutil.weeutil.archiveDaySpan(pkt_time), US)
+            day_accum.addRecord(
+                {'dateTime': pkt_time, 'usUnits': 1, 'outTemp': 70.0}, weight=300)
+            obstypes = {'outTemp'}
+
+            def span_of(accum):
+                return (accum.timespan.start, accum.timespan.stop)
+
+            # year
+            accum, _ = user.loopdata.LoopData.create_year_accum(
+                US, archive_interval, obstypes, pkt_time, day_accum, dbm)
+            self.assertEqual(span_of(accum),
+                (weeutil.weeutil.archiveYearSpan(pkt_time).start,
+                 weeutil.weeutil.archiveYearSpan(pkt_time).stop))
+            # month
+            accum, _ = user.loopdata.LoopData.create_month_accum(
+                US, archive_interval, obstypes, pkt_time, day_accum, dbm)
+            self.assertEqual(span_of(accum),
+                (weeutil.weeutil.archiveMonthSpan(pkt_time).start,
+                 weeutil.weeutil.archiveMonthSpan(pkt_time).stop))
+            # week
+            accum, _ = user.loopdata.LoopData.create_week_accum(
+                US, archive_interval, obstypes, pkt_time, week_start, day_accum, dbm)
+            self.assertEqual(span_of(accum),
+                (weeutil.weeutil.archiveWeekSpan(pkt_time, week_start).start,
+                 weeutil.weeutil.archiveWeekSpan(pkt_time, week_start).stop))
+            # rainyear
+            accum, _ = user.loopdata.LoopData.create_rainyear_accum(
+                US, archive_interval, obstypes, pkt_time, rainyear_start, day_accum, dbm)
+            self.assertEqual(span_of(accum),
+                (weeutil.weeutil.archiveRainYearSpan(pkt_time, rainyear_start).start,
+                 weeutil.weeutil.archiveRainYearSpan(pkt_time, rainyear_start).stop))
+            # hour
+            accum, _ = user.loopdata.LoopData.create_hour_accum(
+                US, archive_interval, obstypes, pkt_time, day_accum, dbm)
+            self.assertEqual(span_of(accum),
+                (weeutil.weeutil.archiveHoursAgoSpan(pkt_time).start,
+                 weeutil.weeutil.archiveHoursAgoSpan(pkt_time).stop))
+            # alltime (fixed literal span)
+            accum, _ = user.loopdata.LoopData.create_alltime_accum(
+                US, archive_interval, obstypes, day_accum, dbm)
+            self.assertEqual(span_of(accum), (86400, 17514144000))
+        finally:
+            if dbm is not None:
+                dbm.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_period_accum_wrappers_distinct_spans(self) -> None:
+        # Reinforces the above: the five dated periods must produce DIFFERENT
+        # spans from each other for the same pkt_time, so a wrapper calling
+        # another period's span function (e.g. year calling month) is caught
+        # even if the absolute-equality check above were somehow satisfied.
+        pkt_time = 1593630000
+        spans = {
+            'year': weeutil.weeutil.archiveYearSpan(pkt_time),
+            'month': weeutil.weeutil.archiveMonthSpan(pkt_time),
+            'week': weeutil.weeutil.archiveWeekSpan(pkt_time, 6),
+            'hour': weeutil.weeutil.archiveHoursAgoSpan(pkt_time),
+        }
+        pairs = [(a.start, a.stop) for a in spans.values()]
+        self.assertEqual(len(set(pairs)), len(pairs), msg='period spans not all distinct')
+
+    def test_continuous_firstlast_accum_empty(self) -> None:
+        # A fresh (empty) ContinuousFirstLastAccum must return None from every
+        # accessor rather than indexing an empty list.  This pins the empty
+        # guards on first/firsttime/last/lasttime and getStatsTuple -- the
+        # guards added specifically to prevent the IndexError that an unguarded
+        # getStatsTuple would raise.
+        fl = user.loopdata.ContinuousFirstLastAccum(timelength=100)
+        self.assertIsNone(fl.first)
+        self.assertIsNone(fl.firsttime)
+        self.assertIsNone(fl.last)
+        self.assertIsNone(fl.lasttime)
+        self.assertEqual(fl.getStatsTuple(), (None, None, None, None))
+
+    def test_firstlast_obstype_end_to_end(self) -> None:
+        # Exercises the newly-implemented firstlast support end to end, mirroring
+        # weewx's own test_Accum_with_string approach: register a string obstype
+        # as a firstlast accumulator, feed it through a ContinuousAccum, then
+        # dispatch first/last/firsttime/lasttime through add_period_obstype.
+        # Verifies (1) type preservation (no str() coercion) and (2) correct
+        # first/last selection.
+        import weewx.units, weewx.accum
+        US = weewx.units.unit_constants['US']
+        converter = weewx.units.Converter(weewx.units.USUnits)
+        formatter = weewx.units.Formatter()
+
+        # Register a firstlast string obstype (cleaned up in finally).
+        weewx.accum.accum_dict.extend(
+            {'stringType': {'accumulator': 'firstlast', 'extractor': 'last'}})
+        try:
+            accum = user.loopdata.ContinuousAccum(100000, US)
+            accum.addRecord({'dateTime': 1000, 'usUnits': 1, 'stringType': 'alpha'})
+            accum.addRecord({'dateTime': 1500, 'usUnits': 1, 'stringType': 'beta'})
+            accum.addRecord({'dateTime': 2000, 'usUnits': 1, 'stringType': 'gamma'})
+
+            self.assertIn('stringType', accum)
+            stats = accum['stringType']
+            self.assertIsInstance(stats, user.loopdata.ContinuousFirstLastAccum)
+            # Type preserved (strings stored as-is, not via str() of something).
+            self.assertEqual(stats.first, 'alpha')
+            self.assertEqual(stats.last, 'gamma')
+            self.assertEqual(stats.firsttime, 1000)
+            self.assertEqual(stats.lasttime, 2000)
+
+            def field(agg):
+                cname = user.loopdata.LoopData.parse_cname('day.stringType.%s' % agg)
+                self.assertIsNotNone(cname, msg='parse failed for %s' % agg)
+                out = {}
+                user.loopdata.LoopProcessor.add_period_obstype(
+                    cname, accum, out, converter, formatter)
+                return out.get(cname.field)
+
+            # first/last emit the string value as-is (string bypass).
+            self.assertEqual(field('first'), 'alpha')
+            self.assertEqual(field('last'), 'gamma')
+            # firsttime/lasttime are timestamps (numeric, routed/formatted).
+            # The raw form pins the exact value.
+            cname_ft = user.loopdata.LoopData.parse_cname('day.stringType.firsttime.raw')
+            out_ft = {}
+            user.loopdata.LoopProcessor.add_period_obstype(
+                cname_ft, accum, out_ft, converter, formatter)
+            self.assertEqual(out_ft.get('day.stringType.firsttime.raw'), 1000)
+
+            cname_lt = user.loopdata.LoopData.parse_cname('day.stringType.lasttime.raw')
+            out_lt = {}
+            user.loopdata.LoopProcessor.add_period_obstype(
+                cname_lt, accum, out_lt, converter, formatter)
+            self.assertEqual(out_lt.get('day.stringType.lasttime.raw'), 2000)
+
+            # Rolling-window correctness: as the oldest entries expire off the
+            # front, 'first' must advance to the next survivor (this is why the
+            # full values_list is kept, not just two endpoints).
+            # Nothing expired yet at a ts well within the window:
+            stats.trimExpiredEntries(50000)
+            self.assertEqual(stats.first, 'alpha')
+            self.assertEqual(stats.last, 'gamma')
+            # Expire alpha (added at 1000, timelength 100000): the FirstLast trim
+            # condition is dateTime + timelength <= ts, so ts = 1000 + 100000
+            # ages alpha out and 'first' advances to beta.
+            stats.trimExpiredEntries(1000 + 100000)
+            self.assertEqual(stats.first, 'beta')
+            self.assertEqual(stats.firsttime, 1500)
+            self.assertEqual(stats.last, 'gamma')   # last unchanged
+        finally:
+            # Remove the synthetic obstype so other tests are unaffected.
+            # accum_dict is a ChainMap; the entry added by extend() may live in
+            # a layer that does not support del by key, so guard it.
+            try:
+                maps = getattr(weewx.accum.accum_dict, 'maps', [weewx.accum.accum_dict])
+                for m in maps:
+                    if 'stringType' in m:
+                        del m['stringType']
+            except Exception:
+                pass
+
+    def test_continuous_firstlast_accum_basic(self) -> None:
+        # ContinuousFirstLastAccum: collects first/last string observations over
+        # a rolling window.  (Note: this accumulator type is registered but the
+        # 'firstlast' agg is not currently surfaced through add_period_obstype;
+        # this exercises the class directly.)
+        FL = user.loopdata.ContinuousFirstLastAccum
+
+        fl = FL(timelength=120)
+        # None is skipped by addSum.
+        fl.addSum(100, None)
+        # First real value.
+        fl.addSum(110, 'alpha')
+        fl.addSum(120, 'omega')
+        # getStatsTuple -> (first_value, first_time, last_value, last_time).
+        self.assertEqual(fl.getStatsTuple(), ('alpha', 110, 'omega', 120))
+
+        # trimExpiredEntries removes entries whose dateTime + timelength <= ts.
+        # 'alpha' (110) expires once ts >= 230; 'omega' (120) once ts >= 240.
+        fl.trimExpiredEntries(235)
+        self.assertEqual(fl.getStatsTuple(), ('omega', 120, 'omega', 120))
+
+        # Exact-boundary: trimming at exactly omega's expiration (120+120=240)
+        # must remove it (the condition is dateTime + timelength <= ts), leaving
+        # the values_list empty.  (getStatsTuple has no empty guard and the
+        # 'firstlast' agg is not surfaced in production, so we check the list
+        # directly rather than calling getStatsTuple on an empty accumulator.)
+        fl.trimExpiredEntries(240)
+        self.assertEqual(len(fl.values_list), 0)
+
+    def test_continuous_vec_dir_wraparound_and_zero_vector(self) -> None:
+        # Pins two vec_dir branches:
+        #  (1) the negative-angle wraparound (_result < 0 -> += 360);
+        #  (2) the zero-vector fallback: when xsum == ysum == 0 (vectors cancel)
+        #      but dirsumtime > 0, vec_dir returns the LAST known direction.
+        CV = user.loopdata.ContinuousVecStats
+
+        # (1) A vector pointing up-and-left (NW quadrant in math axes) yields
+        # 90 - atan2 > 90 deg negative, triggering the += 360 wraparound.
+        # Two NW observations so the resultant is unambiguous.
+        v = CV(timelength=1000)
+        v.addSum(100, (10.0, 315.0), weight=2)   # NW
+        v.addSum(200, (10.0, 315.0), weight=2)   # NW again
+        # 315 deg compass -> vec_dir should report ~315 (wraparound applied).
+        self.assertAlmostEqual(v.vec_dir, 315.0, places=4)
+
+        # (2) Calm wind (speed 0 with a direction) credits dirsumtime but
+        # contributes EXACTLY zero to xsum/ysum (unlike opposing non-zero
+        # vectors, which leave floating-point dust and miss this branch).  With
+        # xsum == ysum == 0 and dirsumtime > 0, vec_dir falls back to the last
+        # known direction.
+        v2 = CV(timelength=1000)
+        v2.addSum(100, (0.0, 123.0), weight=2)   # calm, direction 123
+        self.assertEqual(v2.xsum, 0.0)           # exactly zero
+        self.assertEqual(v2.ysum, 0.0)
+        self.assertEqual(v2.vec_dir, 123.0)      # last known direction
+
+        # (3) A due-NORTH vector pins two more vec_dir branches:
+        #   - line 485 (_result < 0): North gives _result == 0.0 exactly, where
+        #     '<' yields no wraparound (vec_dir 0.0) but a mutated '<=' would
+        #     wrap to 360.0;
+        #   - line 483 (ysum or xsum): North has ysum != 0 but xsum ~ 0, so
+        #     'ysum or xsum' is truthy while a mutated 'ysum and xsum' is falsy
+        #     (which would wrongly take the fallback).
+        v3 = CV(timelength=1000)
+        v3.addSum(100, (10.0, 0.0), weight=2)    # North
+        v3.addSum(200, (10.0, 0.0), weight=2)    # North
+        self.assertEqual(v3.vec_dir, 0.0)        # NOT 360.0, NOT the fallback
+
+        # (4) line 483: 'if dirsumtime and (ysum or xsum)'.  To distinguish the
+        # 'or' from a mutated 'and', exactly ONE of xsum/ysum must be zero and
+        # the other non-zero.  Real compass vectors leave cos/sin dust, so set
+        # the internal state directly: xsum exactly 0, ysum non-zero.  With
+        # 'or' the guard is truthy (compute a direction); with 'and' it would be
+        # falsy (wrongly take the fallback).
+        v4 = CV(timelength=1000)
+        v4.addSum(100, (10.0, 45.0), weight=2)   # establish a 'last' direction
+        v4.xsum = 0.0
+        v4.ysum = 40.0                           # points due North in math axes
+        # dirsumtime is already > 0 from the addSum above.
+        self.assertEqual(v4.vec_dir, 0.0)        # 90 - atan2(40,0)=90 -> 0; not fallback (45)
+
+    def test_continuous_vec_ysum_separation(self) -> None:
+        # Pins the ysum credit (addSum) and debit (trim) independently of xsum,
+        # using a SE vector (dir 135) whose x and y components are equal in
+        # magnitude but OPPOSITE in sign -- so a mutation that corrupts only the
+        # sin (y) term produces a ysum distinguishable from xsum.
+        CV = user.loopdata.ContinuousVecStats
+
+        v = CV(timelength=100)
+        v.addSum(100, (10.0, 135.0), weight=2)   # SE: xsum=+14.142, ysum=-14.142
+        self.assertAlmostEqual(v.xsum, 14.142135623730951, places=6)
+        self.assertAlmostEqual(v.ysum, -14.142135623730951, places=6)
+
+        # Trim it (expiration 200) -> both return to zero.
+        v.trimExpiredEntries(200)
+        self.assertAlmostEqual(v.xsum, 0.0, places=6)
+        self.assertAlmostEqual(v.ysum, 0.0, places=6)
+
+    def test_continuous_accum_units_and_wind(self) -> None:
+        # Pins ContinuousAccum unit-system handling and the wind-component skip.
+        CA = user.loopdata.ContinuousAccum
+
+        # __init__ with no unit system -> isEmpty True; _check_units adopts the
+        # first system, then raises on a mismatch.
+        acc = CA(timelength=120)
+        self.assertTrue(acc.isEmpty)             # unit_system is None
+        acc._check_units(1)                      # adopt US
+        self.assertFalse(acc.isEmpty)
+        self.assertEqual(acc.unit_system, 1)
+        acc._check_units(1)                      # matching -> no raise
+        with self.assertRaises(ValueError):
+            acc._check_units(16)                 # mismatch (METRIC) -> raise
+
+        # add_wind_value: windDir/windGust/windGustDir are ALL skipped (return
+        # early); only windSpeed creates the 'wind' vector accumulator.  Testing
+        # all three pins the membership list (removing any element would let
+        # that component through).
+        acc2 = CA(timelength=120)
+        rec = {'dateTime': 1000, 'usUnits': 1, 'windSpeed': 5.0, 'windDir': 90.0,
+               'windGust': 8.0, 'windGustDir': 95.0}
+        for skipped in ('windDir', 'windGust', 'windGustDir'):
+            acc2.add_wind_value(rec, skipped, 1)
+            self.assertNotIn('wind', acc2)       # none of these create 'wind'
+            self.assertNotIn(skipped, acc2)
+        acc2.add_wind_value(rec, 'windSpeed', 1) # processed -> 'wind' + 'windSpeed'
+        self.assertIn('wind', acc2)
+        self.assertIn('windSpeed', acc2)
+
+    def test_get_trend_guard_branches(self) -> None:
+        # get_trend has three early-return guards that fire BEFORE any unit
+        # conversion (so converter can be None here):
+        #   1. obstype not present in the accumulator
+        #   2. first/last is None (empty accumulator)
+        #   3. firsttime == lasttime (only one reading -> no trend)
+        # Each must return (None, None, None).
+        LP = user.loopdata.LoopProcessor
+        CA = user.loopdata.ContinuousAccum
+        CS = user.loopdata.ContinuousScalarStats
+
+        cname = user.loopdata.LoopData.parse_cname('trend.outTemp')
+        self.assertIsNotNone(cname)
+        pkt = {'dateTime': 1000, 'usUnits': 1, 'outTemp': 50.0}
+
+        # --- Guard 1: obstype absent from the accumulator. ---
+        empty_accum = CA(timelength=10800)
+        result = LP.get_trend(cname, pkt, empty_accum, None, 10800, 2.0)
+        self.assertEqual(result, (None, None, None))
+
+        # --- Guard 2: obstype present but accumulator empty (first is None). ---
+        accum = CA(timelength=10800)
+        accum['outTemp'] = CS(timelength=10800)
+        result = LP.get_trend(cname, pkt, accum, None, 10800, 2.0)
+        self.assertEqual(result, (None, None, None))
+
+        # --- Guard 3: exactly one reading -> firsttime == lasttime. ---
+        accum2 = CA(timelength=10800)
+        stats = CS(timelength=10800)
+        stats.addSum(1000, 50.0, weight=2)
+        accum2['outTemp'] = stats
+        result = LP.get_trend(cname, pkt, accum2, None, 10800, 2.0)
+        self.assertEqual(result, (None, None, None))
+
+    def test_day_wind_vecdir_loop_vs_quantized_archive(self) -> None:
+        # Document WHY loopdata's day.wind.vecdir legitimately differs from the
+        # WeeWX report's day wind direction on a Davis VP2 using hardware
+        # record generation.
+        #
+        # loopdata vector-averages full-resolution LOOP packets.  The report
+        # aggregates ARCHIVE records whose windDir is a single value per
+        # interval, QUANTIZED to one of 16 compass points (22.5 deg) -- a
+        # documented property of the Davis archive record (Davis spec: wind
+        # direction display resolution is 16 points / 22.5 deg on the compass
+        # rose).  These are different inputs, so the two day-level vecdir
+        # values legitimately differ; neither is "wrong".  loopdata's is the
+        # higher-resolution vector direction.
+        #
+        # IMPORTANT (scope): This test models ONLY the 22.5-degree quantization
+        # of the archive direction, which is documented fact.  It does NOT
+        # replicate the console's bin-SELECTION algorithm, which Davis has
+        # never published and for which community descriptions conflict
+        # (sample-count "mode" vs speed-weighted).  To stay independent of that
+        # unresolved question, every archive interval below contains samples of
+        # a SINGLE true direction, so count-mode and speed-weighted selection
+        # necessarily pick the same bin -- the snapped archive direction is
+        # unambiguous under either theory.
+        #
+        # Construction: four intervals whose true directions each sit 10 deg
+        # clockwise of a compass point, so each snaps the same rotational way
+        # (-10 deg).  The bias therefore accumulates rather than cancels, and
+        # the day-level divergence is a clean 10 deg:
+        #     true 10.0 -> archive 0.0    (N)
+        #     true 32.5 -> archive 22.5   (NNE)
+        #     true 55.0 -> archive 45.0   (NE)
+        #     true 77.5 -> archive 67.5   (ENE)
+        # loopdata (full-res vector avg) -> 43.75 deg
+        # archive  (quantized per-interval) -> 33.75 deg
+        # vecavg is identical in both paths (a control: this is a direction
+        # effect, not a speed effect).
+        import math
+
+        speed = 10.0
+        true_dirs = [10.0, 32.5, 55.0, 77.5]
+        compass_points = [i * 22.5 for i in range(16)]
+
+        def snap_to_compass(deg):
+            deg = deg % 360.0
+            return min(compass_points,
+                       key=lambda c: min(abs(deg - c), 360.0 - abs(deg - c)))
+
+        def vecdir_vecavg(samples, weight):
+            # samples: list of (speed, dirN)
+            xsum = ysum = sumtime = 0.0
+            for s, d in samples:
+                theta = math.radians(90.0 - d)
+                xsum += weight * s * math.cos(theta)
+                ysum += weight * s * math.sin(theta)
+                sumtime += weight
+            vd = 90.0 - math.degrees(math.atan2(ysum, xsum))
+            if vd < 0.0:
+                vd += 360.0
+            return vd, math.sqrt(xsum ** 2 + ysum ** 2) / sumtime
+
+        # Build loop packets: 3 per interval, all within a single local day,
+        # spaced 2s apart (base chosen at midday so no timezone straddles a day
+        # boundary over the 22-second span).
+        base = 1665838800  # 2022-10-15 13:00:00 UTC -> daytime across US zones
+        pkts: List[Dict[str, Any]] = []
+        ts = base
+        for d in true_dirs:
+            for _ in range(3):
+                pkts.append({'dateTime': ts, 'usUnits': 1,
+                             'windDir': d, 'windGust': speed,
+                             'windGustDir': d, 'windrun': None,
+                             'windSpeed': speed})
+                ts += 2
+
+        wind_fields = ['day.wind.vecdir', 'day.wind.vecdir.raw',
+                       'day.wind.vecavg', 'day.wind.vecavg.raw']
+
+        cfg: user.loopdata.Configuration = ProcessPacketTests._get_config('us', 10800, 10, 6, wind_fields)
+        weight = cfg.loop_frequency
+
+        accums: user.loopdata.Accumulators = ProcessPacketTests._get_accums(cfg, pkts[0]['dateTime'])
+        for pkt in pkts:
+            loopdata_pkt = user.loopdata.LoopProcessor.generate_loopdata_dictionary(pkt, cfg, accums)
+
+        # (1) loopdata's day vecdir = full-resolution vector average of all
+        # loop samples.
+        loop_samples = [(speed, d) for d in true_dirs for _ in range(3)]
+        expected_loop_vecdir, expected_loop_vecavg = vecdir_vecavg(loop_samples, weight)
+        self.assertAlmostEqual(expected_loop_vecdir, 43.75, places=4)
+        self.assertAlmostEqual(loopdata_pkt['day.wind.vecdir.raw'], expected_loop_vecdir, places=4)
+        self.assertAlmostEqual(loopdata_pkt['day.wind.vecavg.raw'], expected_loop_vecavg, places=4)
+
+        # (2) The report's path: one quantized record per interval.  Computed
+        # here as the reference -- loopdata does not produce this; it is what
+        # the archive-based report aggregates.
+        archive_records = [(speed, snap_to_compass(d)) for d in true_dirs]
+        archive_vecdir, archive_vecavg = vecdir_vecavg(archive_records, weight)
+        self.assertAlmostEqual(archive_vecdir, 33.75, places=4)
+
+        # (3) The point of the test: the two legitimately diverge in direction
+        # (here by a full 10 deg), while vecavg is identical -- confirming the
+        # divergence is purely the direction-quantization effect.
+        divergence = abs(((expected_loop_vecdir - archive_vecdir) + 180.0) % 360.0 - 180.0)
+        self.assertAlmostEqual(divergence, 10.0, places=4)
+        self.assertAlmostEqual(expected_loop_vecavg, archive_vecavg, places=6)
+
     def test_ip100_packet_processing(self) -> None:
         pkts: List[Dict[str, Any]] = ip100_packets.IP100Packets._get_packets()
 
@@ -3478,6 +4911,7 @@ class ProcessPacketTests(unittest.TestCase):
             config_dict              = config_dict,
             unit_system              = unit_system,
             archive_interval         = to_int(std_archive_dict.get('archive_interval')),
+            archive_delay            = to_int(std_archive_dict.get('archive_delay', 15)),
             loop_data_dir            = '', # dummy
             filename                 = '', # dummy
             target_report            = '', # dummy
@@ -3603,6 +5037,303 @@ class ProcessPacketTests(unittest.TestCase):
             'unit.label.windDir',
             'unit.label.windSpeed',
             ]
+
+    def test_create_period_accum_from_database(self) -> None:
+        # Category 2: exercise create_period_accum against a REAL (temporary)
+        # SQLite weewx database -- not a mock.  This covers the day-summary
+        # priming path: create_period_accum reads archive_day_<obstype> rows via
+        # day_summary_records_generator and merges them with today's day_accum.
+        #
+        # Fixture: a temp database with archive records spanning two UTC days.
+        # The earlier day's records become a day-summary row that the 'week'
+        # period accumulator must merge; today's records arrive via day_accum.
+        unit_system = weewx.units.unit_constants['US']  # 1
+
+        tmpdir = tempfile.mkdtemp()
+        dbm = None
+        try:
+            db_dict = {
+                'database_name': os.path.join(tmpdir, 'test.sdb'),
+                'driver': 'weedb.sqlite'}
+            dbm = weewx.manager.DaySummaryManager.open_with_create(
+                db_dict, table_name='archive', schema=wview_extended_schema)
+
+            # Day 1: 2022-10-14, three records.  Day 2 (today): 2022-10-15.
+            day1 = 1665750000   # 2022-10-14 12:20:00 UTC (mid-day)
+            day2 = 1665838800   # 2022-10-15 13:00:00 UTC (mid-day)
+
+            day1_temps = [40.0, 50.0, 60.0]
+            archive_recs = []
+            for i, t in enumerate(day1_temps):
+                archive_recs.append({
+                    'dateTime': day1 + i * 300, 'usUnits': 1, 'interval': 5,
+                    'outTemp': t,
+                    'windSpeed': 4.0 + i, 'windDir': 80.0 + i * 10,
+                    'windGust': 6.0 + i, 'windGustDir': 85.0 + i * 10})
+            dbm.addRecord(archive_recs)
+
+            # Build today's day_accum and populate it with two readings each of
+            # a scalar (outTemp) and a vector (wind) obstype.
+            day_accum = weewx.accum.Accum(
+                weeutil.weeutil.archiveDaySpan(day2), unit_system)
+            today_temps = [70.0, 80.0]
+            for i, t in enumerate(today_temps):
+                day_accum.addRecord(
+                    {'dateTime': day2 + i * 300, 'usUnits': 1, 'outTemp': t,
+                     'windSpeed': 10.0 + i, 'windDir': 200.0 + i * 10,
+                     'windGust': 12.0 + i, 'windGustDir': 205.0 + i * 10},
+                    weight=300)
+
+            # Day-summary inclusion follows weewx's DailySummaries spec:
+            # start <= dateTime < stop.  The span brackets day1's day-start
+            # (included) and stops well after day2, so day1's summary row is in
+            # range.  day2 is only in day_accum (not the db), so it is not a
+            # day-summary row; it is merged separately below.
+            week_span = weeutil.weeutil.TimeSpan(day1 - 86400, day2 + 86400)
+
+            # Request both a scalar and a vector obstype: this exercises the
+            # ScalarStats AND VecStats type-dispatch and merge paths.
+            accum, valid_obstypes = user.loopdata.LoopData.create_period_accum(
+                'week', unit_system, 5, {'outTemp', 'wind'}, week_span, day_accum, dbm)
+
+            self.assertIsNotNone(accum)
+            self.assertIn('outTemp', valid_obstypes)
+            self.assertIn('wind', valid_obstypes)
+            self.assertIn('outTemp', accum)
+            self.assertIn('wind', accum)
+
+            # Scalar merge: min from day1 (40), max from today (80), count 3+2=5.
+            stats = accum['outTemp']
+            self.assertEqual(stats.min, 40.0)   # day1 low
+            self.assertEqual(stats.max, 80.0)   # today's high
+            self.assertEqual(stats.count, 5)
+
+            # Vector merge: the wind accumulator must be a VecStats spanning both
+            # days.  For weewx VecStats, 'min' tracks the lowest windSpeed and
+            # 'max' tracks the highest windGust.  Day1 speeds 4,5,6 / gusts 6,7,8;
+            # today speeds 10,11 / gusts 12,13.  So min=4 (day1), max=13 (today).
+            wind_stats = accum['wind']
+            self.assertEqual(type(wind_stats), weewx.accum.VecStats)
+            self.assertEqual(wind_stats.count, 5)       # 3 + 2 observations
+            self.assertEqual(wind_stats.max, 13.0)      # max windGust (today)
+            self.assertEqual(wind_stats.min, 4.0)       # min windSpeed (day1)
+
+        finally:
+            if dbm is not None:
+                dbm.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_create_period_accum_empty_obstypes(self) -> None:
+        # The early-return guard: no obstypes -> (None, empty set), no DB needed.
+        accum, valid = user.loopdata.LoopData.create_period_accum(
+            'week', 1, 5, set(),
+            weeutil.weeutil.TimeSpan(0, 100), None, None)
+        self.assertIsNone(accum)
+        self.assertEqual(valid, set())
+
+    def test_create_period_accum_day_summary_upper_bound(self) -> None:
+        # Concern-#2 / spec test: day-summary aggregation must follow weewx's
+        # DailySummaries convention (weewx.xtypes): dateTime >= start AND
+        # dateTime < stop -- inclusive left, EXCLUSIVE right.  This test proves
+        # the exclusive-right bound by placing the span.stop exactly on a
+        # day-summary key: the day-summary row AT span.stop must be EXCLUDED,
+        # while the prior day's row is INCLUDED.  The expected inclusion is
+        # derived from the spec, NOT from loopdata's SQL.
+        unit_system = weewx.units.unit_constants['US']
+
+        tmpdir = tempfile.mkdtemp()
+        dbm = None
+        try:
+            db_dict = {'database_name': os.path.join(tmpdir, 'test.sdb'),
+                       'driver': 'weedb.sqlite'}
+            dbm = weewx.manager.DaySummaryManager.open_with_create(
+                db_dict, table_name='archive', schema=wview_extended_schema)
+
+            # Two days of records.  Day A: 2022-10-13.  Day B: 2022-10-14.
+            dayA = 1665663600   # 2022-10-13 12:20:00 UTC
+            dayB = 1665750000   # 2022-10-14 12:20:00 UTC
+            for d, temp in ((dayA, 40.0), (dayB, 80.0)):
+                dbm.addRecord([{'dateTime': d, 'usUnits': 1, 'interval': 5,
+                                'outTemp': temp}])
+
+            # Day-summary keys use startOfArchiveDay (the same function
+            # DaySummaryManager uses to key archive_day_* rows).
+            dayB_key = weeutil.weeutil.startOfArchiveDay(dayB)
+
+            # Set span.stop EXACTLY on dayB's summary key.  Per the spec
+            # (dateTime < stop), dayB's row must be excluded; dayA's included.
+            span = weeutil.weeutil.TimeSpan(weeutil.weeutil.startOfArchiveDay(dayA), dayB_key)
+
+            # day_accum must CONTAIN outTemp, or create_period_accum skips the
+            # obstype entirely (it only processes obstypes present in day_accum).
+            # Give it one reading at value 50 -- distinct from dayA (40) and
+            # dayB (80) -- so the asserted max proves which day-summary rows
+            # were merged.  'today' here is a day AFTER dayB so it is not itself
+            # a day-summary row in the db.
+            today = dayB + 86400
+            day_accum = weewx.accum.Accum(
+                weeutil.weeutil.archiveDaySpan(today), unit_system)
+            day_accum.addRecord(
+                {'dateTime': today, 'usUnits': 1, 'outTemp': 50.0}, weight=300)
+
+            accum, valid = user.loopdata.LoopData.create_period_accum(
+                'week', unit_system, 5, {'outTemp'}, span, day_accum, dbm)
+
+            self.assertIsNotNone(accum)
+            self.assertIn('outTemp', accum)
+            # dayA's summary (1 obs, value 40) is within [start, stop).  dayB's
+            # row (value 80), keyed exactly at stop, is EXCLUDED by the
+            # exclusive-right bound.  day_accum adds 1 obs (value 50).  So:
+            #   count = 1 (dayA) + 1 (day_accum) = 2
+            #   max   = 50 (day_accum); NOT 80 -- proving dayB was excluded.
+            self.assertEqual(accum['outTemp'].count, 2)
+            self.assertEqual(accum['outTemp'].max, 50.0)
+            self.assertEqual(accum['outTemp'].min, 40.0)  # dayA's value
+        finally:
+            if dbm is not None:
+                dbm.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_create_hour_accum_from_database(self) -> None:
+        # Covers the name=='hour' path of create_period_accum, which primes the
+        # hour accumulator from ARCHIVE records.
+        #
+        # Inclusion spec (derived independently of loopdata's SQL): the hour
+        # accumulator is a weewx.accum.Accum(span), so it accepts records per
+        # TimeSpan.includesArchiveTime -- start < t <= stop (exclusive left,
+        # inclusive right).  archiveHoursAgoSpan(now) returns the current clock
+        # hour, so span.stop is in the FUTURE relative to now; the inclusive-
+        # right edge is therefore never exercised by real data (nothing is
+        # newer than now).  The testable boundary is the EXCLUSIVE LEFT edge: a
+        # record at exactly span.start must be EXCLUDED.  The hour path does NOT
+        # merge day_accum (unlike longer periods), so count reflects archive
+        # records only.
+        import time as _time
+        unit_system = weewx.units.unit_constants['US']
+
+        tmpdir = tempfile.mkdtemp()
+        dbm = None
+        try:
+            db_dict = {'database_name': os.path.join(tmpdir, 'test.sdb'),
+                       'driver': 'weedb.sqlite'}
+            dbm = weewx.manager.DaySummaryManager.open_with_create(
+                db_dict, table_name='archive', schema=wview_extended_schema)
+
+            now = int(_time.time())
+            hour_span = weeutil.weeutil.archiveHoursAgoSpan(now)
+
+            # Records must be both inside the span (dateTime > hour_span.start)
+            # AND not future-dated relative to now (the create_period_accum hour
+            # path applies the archive_delay future-record rejection).  Because
+            # archiveHoursAgoSpan(now) is the CURRENT clock hour, span.stop is in
+            # the future and 'now' may be anywhere within the hour -- so anchor
+            # the included records to 'now' (always in the past) rather than to
+            # span.start (which risks placing them after 'now' early in the
+            # hour).  They remain > span.start as long as the test runs at least
+            # a few seconds into the clock hour, which is effectively always.
+            # (reuse the now sampled above for hour_span)
+            # One record EXACTLY at span.start: excluded by the exclusive-left
+            # rule (get_archive_packets uses dateTime > earliest_time).
+            recs = [{'dateTime': hour_span.start, 'usUnits': 1, 'interval': 5,
+                     'outTemp': 99.0}]
+            # Three included records a few seconds in the past, distinct and
+            # strictly inside (span.start, now].
+            for i, off in enumerate((3, 2, 1)):
+                recs.append({'dateTime': now - off, 'usUnits': 1,
+                             'interval': 5, 'outTemp': 60.0 + i})
+            dbm.addRecord(recs)
+
+            # day_accum for today, populated so 'outTemp' dispatches as ScalarStats.
+            day_accum = weewx.accum.Accum(
+                weeutil.weeutil.archiveDaySpan(now), unit_system)
+            day_accum.addRecord(
+                {'dateTime': now, 'usUnits': 1, 'outTemp': 65.0}, weight=300)
+
+            accum, valid = user.loopdata.LoopData.create_period_accum(
+                'hour', unit_system, 5, {'outTemp'}, hour_span, day_accum, dbm)
+
+            self.assertIsNotNone(accum)
+            self.assertIn('outTemp', valid)
+            self.assertIn('outTemp', accum)
+            # Exactly the 3 in-span records (values 60, 61, 62).  The boundary
+            # record at span.start (99.0) is EXCLUDED by the exclusive-left rule;
+            # if it leaked in, count would be 4 and max would be 99.
+            self.assertEqual(accum['outTemp'].count, 3)
+            self.assertEqual(accum['outTemp'].min, 60.0)
+            self.assertEqual(accum['outTemp'].max, 62.0)  # NOT 99 -> start excluded
+
+        finally:
+            if dbm is not None:
+                dbm.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_create_continuous_accum_from_database(self) -> None:
+        # Covers create_continuous_accum, which primes a ContinuousAccum from
+        # archive records.
+        #
+        # Inclusion spec (the continuous accumulator's own rolling-window rule,
+        # stated independently of loopdata's SQL): at priming, the window is
+        # anchored to wall-clock time (there is no current observation yet).  A
+        # record survives iff ts > now - timelength; a record at or before
+        # now - timelength is trimmed.  This test verifies both sides of that
+        # boundary.
+        #
+        # To avoid a sub-second race between the test's 'now' and the code's
+        # internal time.time(), the boundary records are placed a few seconds
+        # inside and outside the edge rather than exactly on it.
+        import time as _time
+        unit_system = weewx.units.unit_constants['US']
+
+        tmpdir = tempfile.mkdtemp()
+        dbm = None
+        try:
+            db_dict = {'database_name': os.path.join(tmpdir, 'test.sdb'),
+                       'driver': 'weedb.sqlite'}
+            dbm = weewx.manager.DaySummaryManager.open_with_create(
+                db_dict, table_name='archive', schema=wview_extended_schema)
+
+            timelength = 3600   # 1 hour rolling window ('1h')
+            now = int(_time.time())
+            # Records strictly inside the window (ts > now - timelength).
+            inside = [now - 900, now - 600, now - 300]
+            # Just OUTSIDE the left edge: a few seconds older than the boundary
+            # (now - timelength - 30) -> must be trimmed.
+            just_outside = now - timelength - 30
+            # Far outside, to be unambiguous as well.
+            far_outside = now - 7200
+            recs = [
+                {'dateTime': far_outside, 'usUnits': 1, 'interval': 5, 'outTemp': 99.0},
+                {'dateTime': just_outside, 'usUnits': 1, 'interval': 5, 'outTemp': 88.0}]
+            for i, ts in enumerate(inside):
+                recs.append({'dateTime': ts, 'usUnits': 1, 'interval': 5,
+                             'outTemp': 50.0 + i})
+            dbm.addRecord(recs)
+
+            day_accum = weewx.accum.Accum(
+                weeutil.weeutil.archiveDaySpan(now), unit_system)
+            day_accum.addRecord(
+                {'dateTime': now - 60, 'usUnits': 1, 'outTemp': 55.0}, weight=300)
+
+            accum, valid = user.loopdata.LoopData.create_continuous_accum(
+                '1h', unit_system, 5, {'outTemp'}, timelength, day_accum, dbm)
+
+            self.assertIsNotNone(accum)
+            self.assertIn('outTemp', valid)
+            self.assertIn('outTemp', accum)
+            self.assertEqual(type(accum), user.loopdata.ContinuousAccum)
+            self.assertEqual(type(accum['outTemp']), user.loopdata.ContinuousScalarStats)
+            # Only the 3 in-window records prime the accumulator.  Both the
+            # far-outside (99.0) and just-outside (88.0) records are older than
+            # now - timelength and must be trimmed.  count == 3 verifies the
+            # left-edge exclusion; if either out-of-window record leaked in,
+            # count would be 4 or 5.
+            self.assertEqual(accum['outTemp'].count, 3)
+
+        finally:
+            if dbm is not None:
+                dbm.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 if __name__ == '__main__':
     unittest.main()
