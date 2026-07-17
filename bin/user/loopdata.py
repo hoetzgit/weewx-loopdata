@@ -24,10 +24,11 @@ import threading
 import time
 import paho.mqtt.publish as mqtt_publish
 
+from collections import deque
+from heapq import heapify, heappop, heappush
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
+from typing import Any, Deque, Dict, Generator, Generic, List, Optional, Set, Tuple, TypeVar, Union
 from enum import Enum
-from sortedcontainers import SortedDict
 
 import weewx
 import weewx.defaults
@@ -50,7 +51,7 @@ from weewx.engine import StdService
 # get a logger object
 log = logging.getLogger(__name__)
 
-LOOP_DATA_VERSION = '3.9'
+LOOP_DATA_VERSION = '4.1'
 
 if sys.version_info[0] < 3 or (sys.version_info[0] == 3 and sys.version_info[1] < 7):
     raise weewx.UnsupportedFeature(
@@ -66,6 +67,16 @@ windrun_bucket_suffixes: List[str] = [ 'N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE'
 # Set up windrun_<dir> observation types.
 for suffix in windrun_bucket_suffixes:
     weewx.units.obs_group_dict['windrun_%s' % suffix] = 'group_distance'
+
+def reraise_if_terminate(e: BaseException) -> None:
+    """weewxd stops by raising Terminate from its SIGTERM signal handler --
+    inside whatever the main thread is executing at that instant.  Every
+    broad exception handler on a main-thread path must call this first and
+    hand the exception back, or weewx cannot shut down.  weewxd runs as
+    __main__, so its Terminate class cannot be imported here and is
+    recognized by name."""
+    if type(e).__name__ == 'Terminate':
+        raise e
 
 @dataclass
 class CheetahName:
@@ -135,6 +146,87 @@ class Configuration:
     mqtt_unit_system         : int
 
 # ===============================================================================
+#                                  MinMaxDict
+# ===============================================================================
+
+V = TypeVar('V')
+
+class MinMaxDict(Generic[V]):
+    """A dict with float keys that also tracks the smallest and largest key,
+    fetched with peekitem(0) and peekitem(-1) — the only indexes supported.
+
+    Only the operations the continuous accumulators use are provided: in, [],
+    pop, len and peekitem.
+
+    The keys are the distinct observation values currently in the accumulator's
+    window (duplicate values share a key) — a handful for real sensor data,
+    but potentially one per packet for an obstype whose value never repeats.
+
+    Candidate keys live in two heaps (a min-heap, and a max-heap of negated
+    keys) with lazy deletion: pop() only removes the key from the dict, and
+    peekitem() discards heap entries whose key is no longer live as they
+    surface at the top.  Re-adding a key leaves a duplicate heap entry;
+    duplicates compare equal, so peeks stay correct and the stale copy is
+    discarded once the key dies.  Every live key always has at least one
+    entry in each heap, so peekitem always terminates on a live key when the
+    dict is non-empty.  When the heaps outgrow twice the live key count they
+    are rebuilt, bounding memory and keeping all operations O(log n)
+    amortized — there is no pathological workload: even the worst case the
+    field grammar permits (a 72h trend window, 1s loop interval, every
+    packet's value unique -> ~260k keys) costs single-digit microseconds per
+    packet, while for a handful of keys it matches a plain sorted list.
+    """
+
+    def __init__(self) -> None:
+        self._data: Dict[float, V] = {}
+        self._min_heap: List[float] = []
+        self._max_heap: List[float] = []  # negated keys
+
+    def __contains__(self, key: float) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __getitem__(self, key: float) -> V:
+        return self._data[key]
+
+    def __setitem__(self, key: float, value: V) -> None:
+        if key not in self._data:
+            self._data[key] = value
+            heappush(self._min_heap, key)
+            heappush(self._max_heap, -key)
+            if len(self._min_heap) > 2 * len(self._data) + 16:
+                self._compact()
+        else:
+            self._data[key] = value
+
+    def pop(self, key: float) -> V:
+        # The key's heap entries go stale; peekitem/_compact discard them.
+        return self._data.pop(key)
+
+    def peekitem(self, index: int = -1) -> Tuple[float, V]:
+        if index == 0:
+            heap = self._min_heap
+            while heap[0] not in self._data:
+                heappop(heap)
+            key = heap[0]
+        elif index == -1:
+            heap = self._max_heap
+            while -heap[0] not in self._data:
+                heappop(heap)
+            key = -heap[0]
+        else:
+            raise IndexError('MinMaxDict.peekitem supports only index 0 or -1')
+        return key, self._data[key]
+
+    def _compact(self) -> None:
+        self._min_heap = list(self._data)
+        heapify(self._min_heap)
+        self._max_heap = [-key for key in self._data]
+        heapify(self._max_heap)
+
+# ===============================================================================
 #                             ContinuousScalarStats
 # ===============================================================================
 
@@ -158,16 +250,16 @@ class ContinuousScalarStats(object):
     seconds.
 
     addSum(ts, val, weight)
-              |                          future_debits (List)
+              |                          future_debits (deque)
               |                          --------------------
               '------------------------> ts|expiration(ts+timelength)|value|weight
               |
               |
               v
-        values_dict (Sorted Dict)
+        values_dict (MinMaxDict)
         key         value
         ----------- ------------------------
-        val         timestamp_list (List)
+        val         timestamp_list (deque)
                     --------------
                     ts
 
@@ -177,11 +269,11 @@ class ContinuousScalarStats(object):
     continuous stats instances, trimExpiredEntries(ts) is called on
     all continuous stats instances.
 
-    The list of future debits is stored in a List.  Each time trimExpiredEntries is
+    The future debits are stored in a deque.  Each time trimExpiredEntries is
     called, the top of the list is iterated on looking for any entries where
     the expiration is <= the current dateTime.
 
-    In addition to the future debit list, a values_dict (SortedDict) is maintained where:
+    In addition to the future debit list, a values_dict (MinMaxDict) is maintained where:
     key  : the value specified in the call to addSum
     value: timestamp_list, a list of timestamps (as specified in an addSum call)
            for the particular value of the key
@@ -201,8 +293,8 @@ class ContinuousScalarStats(object):
 
     def __init__(self, timelength: int):
         self.timelength: int = timelength
-        self.future_debits: List[ScalarDebit] = []
-        self.values_dict: SortedDict[float, List[int]] = SortedDict()
+        self.future_debits: Deque[ScalarDebit] = deque()
+        self.values_dict: MinMaxDict[Deque[int]] = MinMaxDict()
         self.sum = 0.0
         self.count = 0
         self.wsum = 0.0
@@ -245,8 +337,8 @@ class ContinuousScalarStats(object):
             self.sumtime += weight
             # Add to values_dict
             if not val in self.values_dict:
-                self.values_dict[val] = []
-            timestamp_list: List[int] = self.values_dict[val]
+                self.values_dict[val] = deque()
+            timestamp_list: Deque[int] = self.values_dict[val]
             timestamp_list.append(ts)
             # Add future debit
             debit= ScalarDebit(
@@ -260,15 +352,15 @@ class ContinuousScalarStats(object):
         # Remove any debits that may have matured.
         while len(self.future_debits) > 0 and self.future_debits[0].expiration <= ts:
             # Apply this debit.
-            debit = self.future_debits.pop(0)
+            debit = self.future_debits.popleft()
             log.debug('Applying debit: %s value: %f, weight: %f' % (timestamp_to_string(debit.timestamp), debit.value, debit.weight))
             self.sum -= debit.value
             self.count -= 1
             self.wsum -= debit.value * debit.weight
             self.sumtime -= debit.weight
             # Remove the debit entry in the values_dict.
-            timestamp_list: List[int] = self.values_dict[debit.value]
-            first_timestamp = timestamp_list.pop(0)
+            timestamp_list: Deque[int] = self.values_dict[debit.value]
+            first_timestamp = timestamp_list.popleft()
             assert first_timestamp == debit.timestamp
             if len(timestamp_list) == 0:
                 self.values_dict.pop(debit.value)
@@ -323,16 +415,16 @@ class ContinuousVecStats(object):
     seconds.
 
     addSum(ts, val(speed,dirN), weight)
-              |                          future_debits (List)
+              |                          future_debits (deque)
               |                          --------------------
               '------------------------> ts|expiration(ts+timelength)|value|weight
               |
               |
               v
-        speed_dict (Sorted Dict)
+        speed_dict (MinMaxDict)
         key         value
         ----------- ------------------------
-        speed       timestamp_dirn_list (List)
+        speed       timestamp_dirn_list (deque)
                     -------------------------
                     tuple(ts, dirN)
 
@@ -342,11 +434,11 @@ class ContinuousVecStats(object):
     continuous stats instances, trimExpiredEntries(ts) is called on
     all continuous stats instances.
 
-    The list of future debits is stored in a List.  Each time trimExpiredEntries is
+    The future debits are stored in a deque.  Each time trimExpiredEntries is
     called, the top of the list is iterated on looking for any entries where
     the expiration is <= the current dateTime.
 
-    In addition to the future debit list, a speed_dict (SortedDict) is maintained where:
+    In addition to the future debit list, a speed_dict (MinMaxDict) is maintained where:
     key  : the value specified in the call to addSum
     value: timestamp_dirn_list, a List of (ts, dirN) tuples
     When addSum is called:
@@ -367,8 +459,8 @@ class ContinuousVecStats(object):
 
     def __init__(self, timelength: int):
         self.timelength: int = timelength
-        self.future_debits: List[VecDebit] = []
-        self.speed_dict: SortedDict[float, List[Tuple[int, float]]] = SortedDict()
+        self.future_debits: Deque[VecDebit] = deque()
+        self.speed_dict: MinMaxDict[Deque[Tuple[int, float]]] = MinMaxDict()
         self.sum = 0.0
         self.count = 0
         self.wsum = 0.0
@@ -441,8 +533,8 @@ class ContinuousVecStats(object):
                 self.dirsumtime += weight
             # Add to speed_dict
             if not speed in self.speed_dict:
-                self.speed_dict[speed] = []
-            timestamp_dirn_list: List[Tuple[int, float]] = self.speed_dict[speed]
+                self.speed_dict[speed] = deque()
+            timestamp_dirn_list: Deque[Tuple[int, float]] = self.speed_dict[speed]
             timestamp_dirn_list.append((ts, dirN))
             # Add future debit
             debit = VecDebit(
@@ -456,7 +548,7 @@ class ContinuousVecStats(object):
     def trimExpiredEntries(self, ts):
         # Remove any debits that may have matured.
         while len(self.future_debits) > 0 and self.future_debits[0].expiration <= ts:
-            debit = self.future_debits.pop(0)
+            debit = self.future_debits.popleft()
             log.debug('Applying ContinuousVecStats debit: %s speed: %f, dirN: %r, weight: %f' % (timestamp_to_string(debit.timestamp), debit.speed, debit.dirN, debit.weight))
             # Apply this debit.
             self.sum -= debit.speed
@@ -472,8 +564,8 @@ class ContinuousVecStats(object):
             if debit.dirN is not None or debit.speed == 0:
                 self.dirsumtime -= debit.weight
             # Remove the debit entry in the speed_dict.
-            timestamp_dirn_list: List[Tuple[int, float]] = self.speed_dict[debit.speed]
-            timestamp, dirN = timestamp_dirn_list.pop(0)
+            timestamp_dirn_list: Deque[Tuple[int, float]] = self.speed_dict[debit.speed]
+            timestamp, dirN = timestamp_dirn_list.popleft()
             assert timestamp == debit.timestamp
             if len(timestamp_dirn_list) == 0:
                 self.speed_dict.pop(debit.speed)
@@ -571,7 +663,7 @@ class ContinuousFirstLastAccum(object):
 
     def __init__(self, timelength: int):
         self.timelength = timelength
-        self.values_list: List[FirstLastEntry] = []
+        self.values_list: Deque[FirstLastEntry] = deque()
 
     def getStatsTuple(self):
         """Return a stats-tuple. That is, a tuple containing the gathered statistics."""
@@ -619,7 +711,7 @@ class ContinuousFirstLastAccum(object):
     def trimExpiredEntries(self, ts):
         # Remove any expired entries
         while len(self.values_list) > 0 and self.values_list[0].dateTime + self.timelength <= ts:
-            self.values_list.pop(0)
+            self.values_list.popleft()
 
 
 # ===============================================================================
@@ -836,6 +928,7 @@ class LoopData(StdService):
             target_report_dict = LoopData.get_target_report_dict(
                 config_dict, target_report)
         except Exception as e:
+            reraise_if_terminate(e)
             log.error('Could not find target_report: %s.  LoopData is exiting. Exception: %s' % (target_report, e))
             return
 
@@ -1083,7 +1176,8 @@ class LoopData(StdService):
             pass # Load the report dict the old fashioned way below
         try:
             skin_dict = weeutil.config.deep_copy(weewx.defaults.defaults)
-        except Exception:
+        except Exception as e:
+            reraise_if_terminate(e)
             # Fall back to copy.deepcopy for earlier than weewx 4.1.2 installs.
             skin_dict = copy.deepcopy(weewx.defaults.defaults)
         skin_dict['REPORT_NAME'] = report
@@ -1111,7 +1205,8 @@ class LoopData(StdService):
             # section.
             try:
                 merge_dict = weeutil.config.deep_copy(config_dict['StdReport']['Defaults'])
-            except Exception:
+            except Exception as e:
+                reraise_if_terminate(e)
                 # Fall back to copy.deepcopy for earlier weewx 4 installs.
                 merge_dict = copy.deepcopy(config_dict['StdReport']['Defaults'])
             weeutil.config.merge_config(skin_dict, merge_dict)
@@ -1171,6 +1266,7 @@ class LoopData(StdService):
             t: threading.Thread = threading.Thread(target=lp.process_queue, name='LoopData', daemon=True)
             t.start()
         except Exception as e:
+            reraise_if_terminate(e)
             # Print problem to log and give up.
             log.error('Error in LoopData setup.  LoopData is exiting. Exception: %s' % e)
             weeutil.logger.log_traceback(log.error, "    ****  ")
